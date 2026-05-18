@@ -60,6 +60,8 @@ export type YtdlpSettings = {
   proxy_port: string
 }
 
+export type LocalDirection = "en-zh" | "zh-en"
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
@@ -129,6 +131,23 @@ export function createTask(url: string) {
     method: "POST",
     body: JSON.stringify({ url }),
   })
+}
+
+export async function uploadLocalTask(file: File, direction: LocalDirection) {
+  const form = new FormData()
+  form.append("direction", direction)
+  form.append("file", file)
+
+  const response = await fetch(`${API_BASE}/api/tasks/upload`, {
+    method: "POST",
+    body: form,
+    cache: "no-store",
+  })
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}))
+    throw new Error(body.detail || `Request failed: ${response.status}`)
+  }
+  return response.json() as Promise<Task>
 }
 
 export function getCookieInfo() {
