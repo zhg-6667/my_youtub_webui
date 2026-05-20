@@ -168,6 +168,7 @@ export function getOpenAISettings() {
 export function saveOpenAISettings(settings: {
   base_url: string
   api_key: string
+  clear_api_key?: boolean
   model: string
   translate_concurrency: string
 }) {
