@@ -19,9 +19,7 @@ def _device() -> str:
 
 
 def separate_audio(video_file: Path, session: Path) -> tuple[Path, Path]:
-    demucs_path = REPO_ROOT / "submodule" / "demucs"
-    if not demucs_path.exists():
-        raise RuntimeError("Demucs submodule is missing. Run: git submodule update --init --recursive")
+    demucs_path = _demucs_source_path()
     sys.path.insert(0, str(demucs_path))
 
     from demucs.api import Separator, save_audio
@@ -45,3 +43,15 @@ def separate_audio(video_file: Path, session: Path) -> tuple[Path, Path]:
     save_audio(vocals, str(vocals_file), samplerate=separator.samplerate)
     save_audio(bgm, str(bgm_file), samplerate=separator.samplerate)
     return vocals_file, bgm_file
+
+
+def _demucs_source_path() -> Path:
+    demucs_path = REPO_ROOT / "submodule" / "demucs"
+    api_file = demucs_path / "demucs" / "api.py"
+    if api_file.exists():
+        return demucs_path
+    raise RuntimeError(
+        "Demucs source submodule is missing or incomplete. "
+        "Clone this repository with git and run: git submodule update --init --recursive. "
+        "Do not use GitHub Download ZIP because it does not include submodules."
+    )
