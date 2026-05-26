@@ -16,6 +16,7 @@ export type TaskStage = {
   name: string
   label: string
   status: StageStatus
+  progress: number | null
   started_at: string | null
   completed_at: string | null
   last_message: string | null

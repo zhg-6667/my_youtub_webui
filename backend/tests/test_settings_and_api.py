@@ -175,6 +175,20 @@ def test_list_tasks_returns_history_newest_first(monkeypatch, tmp_path):
     assert set(body["tasks"][0].keys()) >= {"id", "url", "title", "status", "final_video_path"}
 
 
+def test_task_detail_includes_stage_progress(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=progressapi")
+    database.update_stage(task_id, "tts", progress=42, last_message="Prepared 21/50 TTS clips")
+    client = TestClient(main.app)
+
+    response = client.get(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200
+    stages = {stage["name"]: stage for stage in response.json()["stages"]}
+    assert stages["tts"]["progress"] == 42
+    assert stages["tts"]["last_message"] == "Prepared 21/50 TTS clips"
+
+
 def test_delete_task_removes_session_log_and_record(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     task_id = database.create_task("https://www.youtube.com/watch?v=delvideoidx", task_id="delvideoidx")
@@ -449,7 +463,7 @@ def test_resume_task_requeues_failed_task(monkeypatch, tmp_path):
     monkeypatch.setattr(main.worker, "enqueue", lambda task_id: enqueued.append(task_id))
     task_id = database.create_task("https://www.youtube.com/watch?v=resumevideox", task_id="resumevideox")
     database.update_task(task_id, status="failed", error_message="boom", completed_at=database.now_iso())
-    database.update_stage(task_id, "asr", status="failed", error_message="boom")
+    database.update_stage(task_id, "asr", status="failed", progress=33, error_message="boom")
     database.update_stage(task_id, "download", status="succeeded")
 
     client = TestClient(main.app)
@@ -462,6 +476,7 @@ def test_resume_task_requeues_failed_task(monkeypatch, tmp_path):
     stages = {s["name"]: s for s in body["stages"]}
     assert stages["download"]["status"] == "succeeded"
     assert stages["asr"]["status"] == "pending"
+    assert stages["asr"]["progress"] is None
     assert stages["asr"]["error_message"] is None
     assert enqueued == [task_id]
 

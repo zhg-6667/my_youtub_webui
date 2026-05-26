@@ -47,6 +47,7 @@ def init_db() -> None:
               name TEXT NOT NULL,
               label TEXT NOT NULL,
               status TEXT NOT NULL,
+              progress INTEGER,
               started_at TEXT,
               completed_at TEXT,
               last_message TEXT,
@@ -73,9 +74,12 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (f"ytdlp.{key}", value, now_iso()),
             )
-        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-        if "title" not in existing_columns:
+        task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "title" not in task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN title TEXT")
+        stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_stages)").fetchall()}
+        if "progress" not in stage_columns:
+            conn.execute("ALTER TABLE task_stages ADD COLUMN progress INTEGER")
 
 
 def backfill_titles_from_metadata() -> None:
@@ -228,7 +232,7 @@ def reset_failed_for_resume(task_id: str) -> None:
             """
             UPDATE task_stages
             SET status = 'pending', started_at = NULL, completed_at = NULL,
-                last_message = NULL, error_message = NULL
+                progress = NULL, last_message = NULL, error_message = NULL
             WHERE task_id = ? AND status IN ('failed', 'running')
             """,
             (task_id,),

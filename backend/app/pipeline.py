@@ -3,6 +3,7 @@ from __future__ import annotations
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 
 from . import database
@@ -55,6 +56,7 @@ class PipelineRunner:
     def __init__(self, task_id: str):
         self.task_id = task_id
         self.artifacts = PipelineArtifacts()
+        self._progress_state: dict[str, tuple[int, float]] = {}
         self._stage_handlers: dict[str, Callable[[dict], None]] = {
             "download": self._download,
             "separate": self._separate,
@@ -116,6 +118,19 @@ class PipelineRunner:
         database.update_stage(self.task_id, stage, last_message=message)
         self.log(f"[{stage}] {message}")
 
+    def stage_progress(self, stage: str, progress: int, message: str, *, force: bool = False) -> None:
+        bounded = max(0, min(100, int(progress)))
+        now = monotonic()
+        previous = self._progress_state.get(stage)
+        if previous and not force and bounded < 100:
+            last_progress, last_at = previous
+            if bounded <= last_progress:
+                return
+            if now - last_at < 2:
+                return
+        database.update_stage(self.task_id, stage, progress=bounded, last_message=message)
+        self._progress_state[stage] = (bounded, now)
+
     def _stage_status(self, stage: str) -> str | None:
         task = database.get_task(self.task_id)
         for entry in task["stages"] if task else []:
@@ -126,14 +141,17 @@ class PipelineRunner:
     def _run_stage(self, stage: str) -> None:
         if self._stage_status(stage) == "succeeded":
             database.update_task(self.task_id, current_stage=stage)
+            database.update_stage(self.task_id, stage, progress=100)
             self._restore_cached_stage(stage, database.get_task(self.task_id))
             self.log(f"[{stage}] Reused cached output")
             return
+        self._progress_state.pop(stage, None)
         database.update_task(self.task_id, current_stage=stage)
         database.update_stage(
             self.task_id,
             stage,
             status="running",
+            progress=0,
             started_at=database.now_iso(),
             completed_at=None,
             error_message=None,
@@ -144,6 +162,7 @@ class PipelineRunner:
             self.task_id,
             stage,
             status="succeeded",
+            progress=100,
             completed_at=database.now_iso(),
             last_message="Completed",
         )
@@ -216,7 +235,11 @@ class PipelineRunner:
 
         session = _require(self.artifacts.session, "session")
         video_file = _require(self.artifacts.video_file, "video_file")
-        self.artifacts.vocals_file, self.artifacts.bgm_file = separate_audio(video_file, session)
+        self.artifacts.vocals_file, self.artifacts.bgm_file = separate_audio(
+            video_file,
+            session,
+            progress_callback=lambda progress, message: self.stage_progress("separate", progress, message),
+        )
         self.stage_message("separate", f"Vocals: {self.artifacts.vocals_file.name}, BGM: {self.artifacts.bgm_file.name}")
 
     def _asr(self, task: dict) -> None:
@@ -284,7 +307,12 @@ class PipelineRunner:
         session = _require(self.artifacts.session, "session")
         translation_file = _require(self.artifacts.translation_file, "translation_file")
         vocals_dir = _require(self.artifacts.vocals_dir, "vocals_dir")
-        self.artifacts.tts_dir = generate_tts(translation_file, vocals_dir, session)
+        self.artifacts.tts_dir = generate_tts(
+            translation_file,
+            vocals_dir,
+            session,
+            progress_callback=lambda progress, message: self.stage_progress("tts", progress, message),
+        )
         wav_count = len(list(self.artifacts.tts_dir.glob("*.wav")))
         self.stage_message("tts", f"Generated {wav_count} TTS clips -> {self.artifacts.tts_dir}")
 

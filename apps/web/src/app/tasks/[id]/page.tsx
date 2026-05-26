@@ -75,6 +75,11 @@ function durationOf(start: string | null, end: string | null) {
   return `${minutes}m${rem.toString().padStart(2, "0")}s`
 }
 
+function normalizeProgress(value: number | null | undefined) {
+  if (typeof value !== "number") return null
+  return Math.max(0, Math.min(100, Math.round(value)))
+}
+
 export default function TaskDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params)
   const router = useRouter()
@@ -253,29 +258,40 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
           <CardContent>
             {task ? (
               <ol className="grid gap-3">
-                {task.stages.map((stage, index) => (
-                  <li
-                    key={stage.name}
-                    className="flex items-start gap-3 rounded-lg border border-border bg-background px-4 py-3"
-                  >
-                    <div className="mt-0.5">{stageIcon(stage.status)}</div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-xs text-muted-foreground">#{index + 1}</span>
-                        <p className="font-medium">{stageLabel(stage.name, stage.label)}</p>
-                        <Badge className={statusBadgeClass(stage.status)}>{statusLabel(stage.status)}</Badge>
-                        {stage.started_at ? (
-                          <span className="text-xs text-muted-foreground">
-                            {durationOf(stage.started_at, stage.completed_at)}
-                          </span>
+                {task.stages.map((stage, index) => {
+                  const stageProgress = normalizeProgress(stage.progress)
+                  return (
+                    <li
+                      key={stage.name}
+                      className="flex items-start gap-3 rounded-lg border border-border bg-background px-4 py-3"
+                    >
+                      <div className="mt-0.5">{stageIcon(stage.status)}</div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs text-muted-foreground">#{index + 1}</span>
+                          <p className="font-medium">{stageLabel(stage.name, stage.label)}</p>
+                          <Badge className={statusBadgeClass(stage.status)}>{statusLabel(stage.status)}</Badge>
+                          {stage.started_at ? (
+                            <span className="text-xs text-muted-foreground">
+                              {durationOf(stage.started_at, stage.completed_at)}
+                            </span>
+                          ) : null}
+                        </div>
+                        <p className="mt-1 text-sm text-muted-foreground">
+                          {stage.error_message || stage.last_message || t.common.waiting}
+                        </p>
+                        {stage.status === "running" && stageProgress !== null ? (
+                          <div className="mt-2 flex items-center gap-3">
+                            <Progress value={stageProgress} className="min-w-0 flex-1" />
+                            <span className="w-10 text-right text-xs tabular-nums text-muted-foreground">
+                              {stageProgress}%
+                            </span>
+                          </div>
                         ) : null}
                       </div>
-                      <p className="mt-1 text-sm text-muted-foreground">
-                        {stage.error_message || stage.last_message || t.common.waiting}
-                      </p>
-                    </div>
-                  </li>
-                ))}
+                    </li>
+                  )
+                })}
               </ol>
             ) : null}
 
