@@ -510,6 +510,32 @@ def test_continue_task_requeues_paused_manual_task(monkeypatch, tmp_path):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "queued"
+    assert body["execution_mode"] == "manual"
+    assert enqueued == [task_id]
+
+
+def test_continue_task_can_switch_to_auto(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=continuestepauto",
+        task_id="continuestepauto",
+        execution_mode="manual",
+    )
+    database.update_task(task_id, status="paused")
+    database.update_stage(task_id, "download", status="succeeded", completed_at=database.now_iso())
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/api/tasks/{task_id}/continue",
+        json={"execution_mode": "auto"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["execution_mode"] == "auto"
     assert enqueued == [task_id]
 
 

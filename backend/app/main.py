@@ -40,6 +40,10 @@ class TaskCreate(BaseModel):
     execution_mode: str = "auto"
 
 
+class ContinueTaskRequest(BaseModel):
+    execution_mode: str | None = None
+
+
 class YouTubeCookieUpdate(BaseModel):
     content: str
 
@@ -332,7 +336,7 @@ def redo_stage(task_id: str, stage_name: str) -> dict:
 
 
 @app.post("/api/tasks/{task_id}/continue")
-def continue_task(task_id: str) -> dict:
+def continue_task(task_id: str, payload: ContinueTaskRequest | None = None) -> dict:
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
@@ -340,6 +344,8 @@ def continue_task(task_id: str) -> dict:
         raise HTTPException(status_code=409, detail="Only paused tasks can be continued.")
     if (task.get("execution_mode") or database.DEFAULT_EXECUTION_MODE) != "manual":
         raise HTTPException(status_code=409, detail="Only manual tasks can be continued step by step.")
+    if payload and payload.execution_mode is not None:
+        database.update_task(task_id, execution_mode=normalize_execution_mode(payload.execution_mode))
     _ensure_runtime_ready()
     database.queue_task_for_continue(task_id)
     worker.enqueue(task_id)

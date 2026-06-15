@@ -238,3 +238,46 @@ def test_pipeline_manual_pauses_after_each_stage(monkeypatch, tmp_path):
     assert task["status"] == "paused"
     assert task["stages"][1]["status"] == "succeeded"
     assert task["stages"][2]["status"] == "pending"
+
+
+def test_pipeline_manual_switch_to_auto_runs_remaining_stages(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=manual2auto",
+        task_id="manual2auto",
+        execution_mode="manual",
+    )
+    final_path = tmp_path / "video_final.mp4"
+
+    def download(self, task):
+        session = tmp_path / "session"
+        media = session / "media"
+        media.mkdir(parents=True)
+        video = media / "video_source.mp4"
+        video.write_bytes(b"video")
+        self.artifacts.session = session
+        self.artifacts.video_file = video
+        database.update_task(self.task_id, session_path=str(session), title="manual2auto")
+
+    monkeypatch.setattr(PipelineRunner, "_download", download)
+
+    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio"):
+        monkeypatch.setattr(PipelineRunner, name, _noop_stage)
+
+    def merge_video(self, task):
+        self.artifacts.final_video = final_path
+
+    monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    assert task["status"] == "paused"
+    assert task["stages"][0]["status"] == "succeeded"
+
+    database.update_task(task_id, execution_mode="auto")
+    database.queue_task_for_continue(task_id)
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    assert task["status"] == "succeeded"
+    assert task["execution_mode"] == "auto"
+    assert all(stage["status"] == "succeeded" for stage in task["stages"])

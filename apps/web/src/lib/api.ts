@@ -130,8 +130,11 @@ export function resumeTask(taskId: string) {
   return request<Task>(`/api/tasks/${taskId}/resume`, { method: "POST" })
 }
 
-export function continueTask(taskId: string) {
-  return request<Task>(`/api/tasks/${taskId}/continue`, { method: "POST" })
+export function continueTask(taskId: string, executionMode?: ExecutionMode) {
+  return request<Task>(`/api/tasks/${taskId}/continue`, {
+    method: "POST",
+    body: JSON.stringify(executionMode ? { execution_mode: executionMode } : {}),
+  })
 }
 
 export function redoStage(taskId: string, stageName: string) {

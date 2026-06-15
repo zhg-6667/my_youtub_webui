@@ -143,11 +143,11 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     }
   }
 
-  const handleContinue = async () => {
+  const handleContinue = async (executionMode?: ExecutionMode) => {
     setContinuing(true)
     setContinueError("")
     try {
-      const next = await continueTask(id)
+      const next = await continueTask(id, executionMode)
       setTask(next)
     } catch (err) {
       setContinueError(err instanceof Error ? err.message : t.task.continueError)
@@ -368,12 +368,21 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
               </div>
             ) : null}
             {isPaused ? (
-              <div className="mt-4 flex flex-col gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
-                <p className="text-sm text-sky-900">{t.task.continueHelp}</p>
-                <Button onClick={handleContinue} disabled={continuing}>
-                  {continuing ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
-                  {continuing ? t.task.continuing : t.task.continueTask}
-                </Button>
+              <div className="mt-4 space-y-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm text-sky-900">{t.task.continueHelp}</p>
+                  <Button onClick={() => handleContinue()} disabled={continuing}>
+                    {continuing ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
+                    {continuing ? t.task.continuing : t.task.continueTask}
+                  </Button>
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm text-sky-900">{t.task.continueAutoHelp}</p>
+                  <Button variant="outline" onClick={() => handleContinue("auto")} disabled={continuing}>
+                    {continuing ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
+                    {continuing ? t.task.continuing : t.task.continueAutoTask}
+                  </Button>
+                </div>
               </div>
             ) : null}
             {continueError ? (
