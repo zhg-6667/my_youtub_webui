@@ -586,6 +586,49 @@ def test_redo_stage_requeues_manual_task(monkeypatch, tmp_path):
     assert enqueued == [task_id]
 
 
+def test_redo_stage_runtime_failure_preserves_artifacts_and_state(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "redo-runtime-session"
+    metadata = session / "metadata"
+    tts_dir = session / "segments" / "tts"
+    metadata.mkdir(parents=True)
+    tts_dir.mkdir(parents=True)
+    translation = metadata / "translation.zh.json"
+    tts_file = tts_dir / "0001.wav"
+    translation.write_text("{}", encoding="utf-8")
+    tts_file.write_bytes(b"wav")
+
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=redoruntime",
+        task_id="redoruntime",
+        execution_mode="manual",
+    )
+    database.update_task(task_id, status="paused", session_path=str(session), current_stage="merge_video")
+    for stage in ("download", "separate", "asr", "asr_fix", "translate", "split_audio", "tts"):
+        database.update_stage(task_id, stage, status="succeeded", completed_at=database.now_iso())
+    monkeypatch.setattr(
+        main,
+        "validate_runtime_device",
+        lambda: (_ for _ in ()).throw(RuntimeError("runtime unavailable")),
+    )
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+
+    client = TestClient(main.app)
+    response = client.post(f"/api/tasks/{task_id}/stages/translate/redo")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "runtime unavailable"
+    assert translation.exists()
+    assert tts_file.exists()
+    assert enqueued == []
+    task = database.get_task(task_id)
+    stages = {stage["name"]: stage for stage in task["stages"]}
+    assert task["status"] == "paused"
+    assert stages["translate"]["status"] == "succeeded"
+    assert stages["tts"]["status"] == "succeeded"
+
+
 def test_redo_stage_rejects_auto_task(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     task_id = database.create_task("https://www.youtube.com/watch?v=redostgauto", task_id="redostgauto")
@@ -652,9 +695,77 @@ def test_upload_local_video_creates_task_and_saved_file(monkeypatch, tmp_path):
     assert body["title"] == "clip"
     assert body["url"].startswith(f"local://upload/{body['id']}?direction=zh-en")
     assert enqueued == [body["id"]]
-    saved = list((config.WORKFOLDER / "_uploads" / body["id"]).iterdir())
+    saved = list((config.WORKFOLDER / "_uploads" / body["id"] / "video").iterdir())
     assert len(saved) == 1
     assert saved[0].read_bytes() == b"mp4data"
+
+
+def test_upload_local_video_can_save_translated_srt(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda task_id: enqueued.append(task_id))
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/tasks/upload",
+        data={"direction": "en-zh"},
+        files={
+            "file": ("clip.mp4", b"mp4data", "video/mp4"),
+            "subtitle_file": (
+                "clip.zh.srt",
+                b"1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+                "application/x-subrip",
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+    task_id = response.json()["id"]
+    assert enqueued == [task_id]
+    video_files = list((config.WORKFOLDER / "_uploads" / task_id / "video").iterdir())
+    subtitle_files = list((config.WORKFOLDER / "_uploads" / task_id / "subtitle").iterdir())
+    assert [path.name for path in video_files] == ["clip.mp4"]
+    assert [path.name for path in subtitle_files] == ["clip.zh.srt"]
+    assert subtitle_files[0].read_bytes().startswith(b"1\n00:00:00,000")
+
+
+def test_upload_local_video_rejects_non_srt_subtitle(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/tasks/upload",
+        data={"direction": "en-zh"},
+        files={
+            "file": ("clip.mp4", b"mp4data", "video/mp4"),
+            "subtitle_file": ("clip.vtt", b"WEBVTT", "text/vtt"),
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Only .srt subtitle files are supported."
+
+
+def test_upload_local_video_rejects_malformed_srt_and_cleans_upload(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda task_id: enqueued.append(task_id))
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/tasks/upload",
+        data={"direction": "en-zh"},
+        files={
+            "file": ("clip.mp4", b"mp4data", "video/mp4"),
+            "subtitle_file": ("broken.srt", b"not an srt file", "application/x-subrip"),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Invalid SRT subtitle file" in response.json()["detail"]
+    assert enqueued == []
+    assert database.list_tasks() == []
+    assert not any((config.WORKFOLDER / "_uploads").glob("*"))
 
 
 def test_create_task_rejects_local_upload_url(monkeypatch, tmp_path):

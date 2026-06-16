@@ -98,9 +98,11 @@ https://github.com/user-attachments/assets/158de60a-7de4-4ddf-b3d8-478d0423aee6
 
 ```powershell
 # Windows PowerShell（任选你本机已有的包管理器）
-winget install Gyan.FFmpeg
+winget install Gyan.FFmpeg.Shared
 winget install OpenJS.NodeJS.LTS
 ```
+
+Windows 上建议安装 FFmpeg 的 shared/full-shared 版本；安装后请确认 `ffmpeg -version` 和 `ffprobe -version` 可用，并且 FFmpeg 的 DLL 目录在 `PATH` 中，否则音频分离阶段可能无法加载 TorchCodec/FFmpeg 运行库。
 
 ```bash
 # Ubuntu / Debian / WSL2
@@ -215,6 +217,8 @@ cp env.txt.example .env
 | `OPENAI_API_KEY` | 翻译阶段使用的 API key。 |
 | `OPENAI_MODEL` | 翻译阶段使用的 Chat Completions 模型。 |
 | `OPENAI_TRANSLATE_CONCURRENCY` | 翻译阶段的并发请求数，默认 `50`。 |
+| `LOCAL_UPLOAD_MAX_BYTES` | 本地视频上传大小上限，默认 4 GiB。 |
+| `LOCAL_SUBTITLE_MAX_BYTES` | 可选本地 SRT 字幕上传大小上限，默认 20 MiB。 |
 | `YTDLP_PROXY_PORT` | yt-dlp 使用的本机代理端口，例如 `7890`。 |
 | `HTTP_PROXY` / `ALL_PROXY` | 未在 UI 中设置代理端口时，yt-dlp 可读取 `HTTP_PROXY`；HTTPX/OpenAI SDK 也会读取这些环境代理。 |
 | `NO_PROXY` | 逗号分隔的代理绕过列表；使用本地 OpenAI 兼容服务时建议包含 `localhost,127.0.0.1,::1`，避免本地请求绕行系统代理。 |
@@ -276,7 +280,9 @@ http://localhost:3000
 4. 填写 OpenAI base URL 和 API key。
 5. 点击 `Get models` 拉取模型列表，或手动输入模型名。
 6. 按 API 提供商额度调整 `Translate concurrency`。
-7. 回到首页，提交 YouTube URL 或 Bilibili URL。
+7. 回到首页，提交 YouTube URL、Bilibili URL，或上传本地视频。
+   - 本地视频可额外上传一份已翻译好的 `.srt` 字幕；上传后会跳过 Whisper 识别和 OpenAI 翻译，直接用这份字幕生成配音与压制字幕。
+   - 翻译方向决定字幕目标语言，例如选择“英文 -> 中文”时，上传的 SRT 会被视为中文字幕。
 8. 进入任务详情页查看阶段进度、运行日志和最终视频。
 
 API key 和 Cookie 会在页面中脱敏显示，后端不会把 Cookie 明文返回给前端。
@@ -306,6 +312,8 @@ YouTube / Bilibili URL
   -> 对齐配音时长并与背景音混音
   -> FFmpeg 压制字幕并输出最终 mp4
 ```
+
+本地视频上传使用同一条后半段流水线。若同时上传已翻译 `.srt` 字幕，系统会从 SRT 生成内部字幕时间轴，跳过 Whisper 与 OpenAI 翻译阶段，然后继续切分参考音频、生成配音、混音并压制字幕。v1 仅支持本地视频搭配 `.srt`，不支持 URL 任务附加字幕。
 
 ## 功能亮点
 

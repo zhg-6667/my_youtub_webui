@@ -101,6 +101,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [continuing, setContinuing] = useState(false)
   const [continueError, setContinueError] = useState("")
   const [redoingStage, setRedoingStage] = useState<string | null>(null)
+  const [redoConfirmStage, setRedoConfirmStage] = useState<string | null>(null)
   const [redoError, setRedoError] = useState("")
 
   const handleDelete = async () => {
@@ -162,11 +163,19 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     try {
       const next = await redoStage(id, stageName)
       setTask(next)
+      return true
     } catch (err) {
       setRedoError(err instanceof Error ? err.message : t.task.redoStageError)
+      return false
     } finally {
       setRedoingStage(null)
     }
+  }
+
+  const handleConfirmRedoStage = async () => {
+    if (!redoConfirmStage) return
+    const succeeded = await handleRedoStage(redoConfirmStage)
+    if (succeeded) setRedoConfirmStage(null)
   }
 
   const isRunning = task?.status === "running"
@@ -175,6 +184,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const isPaused = task?.status === "paused"
   const isManual = task?.execution_mode === "manual"
   const canRedoStage = isManual && !isRunning && !isQueued
+  const redoConfirmStageInfo = task?.stages.find((stage) => stage.name === redoConfirmStage)
 
   useEffect(() => {
     let cancelled = false
@@ -333,7 +343,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                               size="sm"
                               className="ml-auto h-7 px-2 text-xs"
                               disabled={redoingStage !== null}
-                              onClick={() => handleRedoStage(stage.name)}
+                              onClick={() => setRedoConfirmStage(stage.name)}
                             >
                               {redoingStage === stage.name ? (
                                 <Loader2 className="size-3 animate-spin" />
@@ -367,6 +377,31 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                 {task.error_message}
               </div>
             ) : null}
+            <Dialog
+              open={redoConfirmStage !== null}
+              onOpenChange={(open) => {
+                if (!open && redoingStage === null) setRedoConfirmStage(null)
+              }}
+            >
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>{t.task.redoStageTitle}</DialogTitle>
+                  <DialogDescription>
+                    {t.task.redoStageDescription} {redoConfirmStageInfo ? stageLabel(redoConfirmStageInfo.name, redoConfirmStageInfo.label) : ""}
+                    {t.common.sentenceEnd}
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose render={<Button variant="outline" disabled={redoingStage !== null} />}>
+                    {t.common.cancel}
+                  </DialogClose>
+                  <Button onClick={handleConfirmRedoStage} disabled={redoingStage !== null}>
+                    {redoingStage ? <Loader2 className="size-4 animate-spin" /> : <RotateCw className="size-4" />}
+                    {redoingStage ? t.task.redoingStage : t.task.confirmRedoStage}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
             {isPaused ? (
               <div className="mt-4 space-y-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-3">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
