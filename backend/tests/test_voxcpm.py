@@ -26,6 +26,15 @@ def _write_translation_json(path: Path, items: list[dict]) -> Path:
     return path
 
 
+_CACHE_GENERATION_DEFAULTS = {
+    "min_len": 2,
+    "max_len": 4096,
+    "retry_badcase": True,
+    "retry_badcase_max_times": 3,
+    "retry_badcase_ratio_threshold": 6.0,
+}
+
+
 @patch.object(voxcpm_mod, "_fallback_reference")
 @patch.object(voxcpm_mod, "_load_model")
 def test_fallback_cache_built_once_and_reused(mock_load, mock_fallback, tmp_path):
@@ -81,18 +90,21 @@ def test_fallback_cache_built_once_and_reused(mock_load, mock_fallback, tmp_path
                 prompt_cache=mock_cache,
                 cfg_value=2.0,
                 inference_timesteps=10,
+                **_CACHE_GENERATION_DEFAULTS,
             ),
             call(
                 target_text="Another fallback sentence.",
                 prompt_cache=mock_cache,
                 cfg_value=2.0,
                 inference_timesteps=10,
+                **_CACHE_GENERATION_DEFAULTS,
             ),
             call(
                 target_text="Third fallback.",
                 prompt_cache=mock_cache,
                 cfg_value=2.0,
                 inference_timesteps=10,
+                **_CACHE_GENERATION_DEFAULTS,
             ),
         ]
     )
@@ -151,6 +163,8 @@ def test_skips_existing_tts_files(mock_load, mock_fallback, tmp_path):
     assert mock_tts_model.generate_with_prompt_cache.call_count == 1
     call_kwargs = mock_tts_model.generate_with_prompt_cache.call_args.kwargs
     assert call_kwargs["target_text"] == "Second sentence."
+    for key, value in _CACHE_GENERATION_DEFAULTS.items():
+        assert call_kwargs[key] == value
 
 
 @patch.object(voxcpm_mod, "_fallback_reference")
@@ -245,3 +259,42 @@ def test_model_generate_used_for_own_reference(mock_load, mock_fallback, tmp_pat
     # generate_with_prompt_cache is not used (both have their own ref)
     mock_tts_model.generate_with_prompt_cache.assert_not_called()
     assert mock_model.generate.call_count == 2
+
+
+@patch.object(voxcpm_mod, "_fallback_reference")
+@patch.object(voxcpm_mod, "_load_model")
+def test_fallback_cache_preserves_wrapper_generation_behavior(mock_load, mock_fallback, tmp_path):
+    """Cached fallback generation keeps VoxCPM.generate defaults and text cleanup."""
+    session = tmp_path / "session"
+    vocals_dir = session / "segments" / "vocals"
+    ref_0001 = _make_synthetic_wav(vocals_dir / "0001.wav", duration_ms=600)
+    mock_fallback.return_value = ref_0001
+
+    translation = _write_translation_json(
+        session / "metadata" / "translation.en.json",
+        [{"dst": "Hello\n   cached    world."}],
+    )
+
+    mock_tts_model = MagicMock()
+    mock_tts_model.sample_rate = 16000
+    mock_cache = {"ref_audio_feat": MagicMock(), "mode": "reference"}
+    mock_tts_model.build_prompt_cache.return_value = mock_cache
+
+    fake_wav_tensor = MagicMock()
+    fake_wav_tensor.squeeze.return_value.cpu.return_value.numpy.return_value = np.zeros(1600, dtype=np.float32)
+    mock_tts_model.generate_with_prompt_cache.return_value = (fake_wav_tensor, MagicMock(), MagicMock())
+
+    mock_model = MagicMock()
+    mock_model.tts_model = mock_tts_model
+    mock_load.return_value = mock_model
+
+    voxcpm_mod.generate_tts(translation, vocals_dir, session)
+
+    mock_tts_model.generate_with_prompt_cache.assert_called_once_with(
+        target_text="Hello cached world.",
+        prompt_cache=mock_cache,
+        cfg_value=2.0,
+        inference_timesteps=10,
+        **_CACHE_GENERATION_DEFAULTS,
+    )
+    mock_model.generate.assert_not_called()
