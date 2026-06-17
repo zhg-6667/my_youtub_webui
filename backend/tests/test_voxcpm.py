@@ -35,9 +35,8 @@ _CACHE_GENERATION_DEFAULTS = {
 }
 
 
-@patch.object(voxcpm_mod, "_fallback_reference")
 @patch.object(voxcpm_mod, "_load_model")
-def test_fallback_cache_built_once_and_reused(mock_load, mock_fallback, tmp_path):
+def test_fallback_cache_built_once_and_reused(mock_load, tmp_path):
     """Prompt cache is built exactly once for the fallback reference."""
     session = tmp_path / "session"
     vocals_dir = session / "segments" / "vocals"
@@ -45,9 +44,6 @@ def test_fallback_cache_built_once_and_reused(mock_load, mock_fallback, tmp_path
     ref_0002 = _make_synthetic_wav(vocals_dir / "0002.wav", duration_ms=600)
     ref_0003 = _make_synthetic_wav(vocals_dir / "0003.wav", duration_ms=300)
     ref_0004 = _make_synthetic_wav(vocals_dir / "0004.wav", duration_ms=2000)
-
-    fallback_path = ref_0004
-    mock_fallback.return_value = fallback_path
 
     translation = _write_translation_json(
         session / "metadata" / "translation.en.json",
@@ -78,7 +74,7 @@ def test_fallback_cache_built_once_and_reused(mock_load, mock_fallback, tmp_path
 
     # build_prompt_cache called exactly once with fallback path
     mock_tts_model.build_prompt_cache.assert_called_once_with(
-        reference_wav_path=str(fallback_path)
+        reference_wav_path=str(ref_0004)
     )
 
     # generate_with_prompt_cache called for the 3 short segments
@@ -119,9 +115,8 @@ def test_fallback_cache_built_once_and_reused(mock_load, mock_fallback, tmp_path
     )
 
 
-@patch.object(voxcpm_mod, "_fallback_reference")
 @patch.object(voxcpm_mod, "_load_model")
-def test_skips_existing_tts_files(mock_load, mock_fallback, tmp_path):
+def test_skips_existing_tts_files(mock_load, tmp_path):
     """Pre-existing TTS output files are not regenerated."""
     session = tmp_path / "session"
     vocals_dir = session / "segments" / "vocals"
@@ -130,9 +125,6 @@ def test_skips_existing_tts_files(mock_load, mock_fallback, tmp_path):
 
     ref_0001 = _make_synthetic_wav(vocals_dir / "0001.wav", duration_ms=600)
     ref_0002 = _make_synthetic_wav(vocals_dir / "0002.wav", duration_ms=600)
-    fallback_path = ref_0002
-    mock_fallback.return_value = fallback_path
-
     translation = _write_translation_json(
         session / "metadata" / "translation.en.json",
         [
@@ -167,9 +159,8 @@ def test_skips_existing_tts_files(mock_load, mock_fallback, tmp_path):
         assert call_kwargs[key] == value
 
 
-@patch.object(voxcpm_mod, "_fallback_reference")
 @patch.object(voxcpm_mod, "_load_model")
-def test_empty_translation_skips_tts(mock_load, mock_fallback, tmp_path):
+def test_empty_translation_skips_tts(mock_load, tmp_path):
     """Empty translation items list returns early without calling the model."""
     session = tmp_path / "session"
     translation = _write_translation_json(
@@ -182,20 +173,16 @@ def test_empty_translation_skips_tts(mock_load, mock_fallback, tmp_path):
 
     result = voxcpm_mod.generate_tts(translation, tmp_path, session)
     assert result == session / "segments" / "tts"
-    mock_model.tts_model.build_prompt_cache.assert_not_called()
+    mock_load.assert_not_called()
 
 
-@patch.object(voxcpm_mod, "_fallback_reference")
 @patch.object(voxcpm_mod, "_load_model")
-def test_calls_progress_callback(mock_load, mock_fallback, tmp_path):
+def test_calls_progress_callback(mock_load, tmp_path):
     """Progress callback is invoked for each item and reports 100 at the end."""
     session = tmp_path / "session"
     vocals_dir = session / "segments" / "vocals"
     ref_0001 = _make_synthetic_wav(vocals_dir / "0001.wav", duration_ms=600)
     ref_0002 = _make_synthetic_wav(vocals_dir / "0002.wav", duration_ms=600)
-
-    fallback_path = ref_0002
-    mock_fallback.return_value = fallback_path
 
     translation = _write_translation_json(
         session / "metadata" / "translation.en.json",
@@ -226,16 +213,13 @@ def test_calls_progress_callback(mock_load, mock_fallback, tmp_path):
     assert progress_calls[2].args[0] == 100
 
 
-@patch.object(voxcpm_mod, "_fallback_reference")
 @patch.object(voxcpm_mod, "_load_model")
-def test_model_generate_used_for_own_reference(mock_load, mock_fallback, tmp_path):
+def test_model_generate_used_for_own_reference(mock_load, tmp_path):
     """Sentences with their own long-enough reference still use model.generate."""
     session = tmp_path / "session"
     vocals_dir = session / "segments" / "vocals"
     ref_0001 = _make_synthetic_wav(vocals_dir / "0001.wav", duration_ms=2000)
     ref_0002 = _make_synthetic_wav(vocals_dir / "0002.wav", duration_ms=2000)
-
-    mock_fallback.return_value = ref_0001
 
     translation = _write_translation_json(
         session / "metadata" / "translation.en.json",
@@ -261,15 +245,12 @@ def test_model_generate_used_for_own_reference(mock_load, mock_fallback, tmp_pat
     assert mock_model.generate.call_count == 2
 
 
-@patch.object(voxcpm_mod, "_fallback_reference")
 @patch.object(voxcpm_mod, "_load_model")
-def test_fallback_cache_preserves_wrapper_generation_behavior(mock_load, mock_fallback, tmp_path):
+def test_fallback_cache_preserves_wrapper_generation_behavior(mock_load, tmp_path):
     """Cached fallback generation keeps VoxCPM.generate defaults and text cleanup."""
     session = tmp_path / "session"
     vocals_dir = session / "segments" / "vocals"
     ref_0001 = _make_synthetic_wav(vocals_dir / "0001.wav", duration_ms=600)
-    mock_fallback.return_value = ref_0001
-
     translation = _write_translation_json(
         session / "metadata" / "translation.en.json",
         [{"dst": "Hello\n   cached    world."}],
@@ -298,3 +279,112 @@ def test_fallback_cache_preserves_wrapper_generation_behavior(mock_load, mock_fa
         **_CACHE_GENERATION_DEFAULTS,
     )
     mock_model.generate.assert_not_called()
+
+
+@patch.object(voxcpm_mod, "_load_model")
+def test_fallback_cache_is_scoped_by_speaker(mock_load, tmp_path):
+    session = tmp_path / "session"
+    vocals_dir = session / "segments" / "vocals"
+    _make_synthetic_wav(vocals_dir / "0001.wav", duration_ms=500)
+    ref_a_long = _make_synthetic_wav(vocals_dir / "0002.wav", duration_ms=2000)
+    _make_synthetic_wav(vocals_dir / "0003.wav", duration_ms=600)
+    ref_b_long = _make_synthetic_wav(vocals_dir / "0004.wav", duration_ms=2200)
+
+    translation = _write_translation_json(
+        session / "metadata" / "translation.en.json",
+        [
+            {"dst": "A needs fallback.", "speaker": "A"},
+            {"dst": "A own reference.", "speaker": "A"},
+            {"dst": "B needs fallback.", "speaker": "B"},
+            {"dst": "B own reference.", "speaker": "B"},
+        ],
+    )
+
+    mock_tts_model = MagicMock()
+    mock_tts_model.sample_rate = 16000
+    cache_a = {"ref_audio_feat": MagicMock(), "mode": "reference", "speaker": "A"}
+    cache_b = {"ref_audio_feat": MagicMock(), "mode": "reference", "speaker": "B"}
+    mock_tts_model.build_prompt_cache.side_effect = [cache_a, cache_b]
+
+    fake_wav_tensor = MagicMock()
+    fake_wav_tensor.squeeze.return_value.cpu.return_value.numpy.return_value = np.zeros(1600, dtype=np.float32)
+    mock_tts_model.generate_with_prompt_cache.return_value = (fake_wav_tensor, MagicMock(), MagicMock())
+
+    mock_model = MagicMock()
+    mock_model.tts_model = mock_tts_model
+    mock_model.generate.return_value = np.zeros(1600, dtype=np.float32)
+    mock_load.return_value = mock_model
+
+    voxcpm_mod.generate_tts(translation, vocals_dir, session)
+
+    mock_tts_model.build_prompt_cache.assert_has_calls(
+        [
+            call(reference_wav_path=str(ref_a_long)),
+            call(reference_wav_path=str(ref_b_long)),
+        ]
+    )
+    assert mock_tts_model.build_prompt_cache.call_count == 2
+    mock_tts_model.generate_with_prompt_cache.assert_has_calls(
+        [
+            call(
+                target_text="A needs fallback.",
+                prompt_cache=cache_a,
+                cfg_value=2.0,
+                inference_timesteps=10,
+                **_CACHE_GENERATION_DEFAULTS,
+            ),
+            call(
+                target_text="B needs fallback.",
+                prompt_cache=cache_b,
+                cfg_value=2.0,
+                inference_timesteps=10,
+                **_CACHE_GENERATION_DEFAULTS,
+            ),
+        ]
+    )
+    assert mock_model.generate.call_count == 2
+
+
+@patch.object(voxcpm_mod, "_load_model")
+def test_fallback_keeps_same_speaker_when_only_other_speaker_has_long_reference(mock_load, tmp_path):
+    session = tmp_path / "session"
+    vocals_dir = session / "segments" / "vocals"
+    ref_a_short = _make_synthetic_wav(vocals_dir / "0001.wav", duration_ms=500)
+    ref_b_long = _make_synthetic_wav(vocals_dir / "0002.wav", duration_ms=2200)
+    _make_synthetic_wav(vocals_dir / "0003.wav", duration_ms=700)
+
+    translation = _write_translation_json(
+        session / "metadata" / "translation.en.json",
+        [
+            {"dst": "A first fallback.", "speaker": "A"},
+            {"dst": "B own reference.", "speaker": "B"},
+            {"dst": "A second fallback.", "speaker": "A"},
+        ],
+    )
+
+    mock_tts_model = MagicMock()
+    mock_tts_model.sample_rate = 16000
+    cache_a = {"ref_audio_feat": MagicMock(), "mode": "reference", "speaker": "A"}
+    mock_tts_model.build_prompt_cache.return_value = cache_a
+
+    fake_wav_tensor = MagicMock()
+    fake_wav_tensor.squeeze.return_value.cpu.return_value.numpy.return_value = np.zeros(1600, dtype=np.float32)
+    mock_tts_model.generate_with_prompt_cache.return_value = (fake_wav_tensor, MagicMock(), MagicMock())
+
+    mock_model = MagicMock()
+    mock_model.tts_model = mock_tts_model
+    mock_model.generate.return_value = np.zeros(1600, dtype=np.float32)
+    mock_load.return_value = mock_model
+
+    voxcpm_mod.generate_tts(translation, vocals_dir, session)
+
+    mock_tts_model.build_prompt_cache.assert_called_once_with(
+        reference_wav_path=str(ref_a_short)
+    )
+    mock_model.generate.assert_called_once_with(
+        text="B own reference.",
+        reference_wav_path=str(ref_b_long),
+        cfg_value=2.0,
+        inference_timesteps=10,
+    )
+    assert mock_tts_model.generate_with_prompt_cache.call_count == 2

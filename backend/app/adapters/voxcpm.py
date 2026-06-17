@@ -47,14 +47,42 @@ def _load_model():
     return _MODEL
 
 
-def _fallback_reference(vocals_dir: Path, min_ms: int) -> Path:
-    files = sorted(vocals_dir.glob("*.wav"))
-    if not files:
-        raise FileNotFoundError("No vocal segments were generated for VoxCPM references.")
+def _first_reference(files: list[Path], min_ms: int) -> Path | None:
     for path in files:
         if len(AudioSegment.from_file(path)) >= min_ms:
             return path
-    return files[0]
+    if files:
+        return files[0]
+    return None
+
+
+def _speaker(item: dict) -> str:
+    speaker = item.get("speaker")
+    if speaker is None:
+        return "1"
+    speaker = str(speaker).strip()
+    return speaker or "1"
+
+
+def _fallback_references(vocals_dir: Path, items: list[dict], min_ms: int) -> tuple[dict[str, Path], Path]:
+    files = sorted(vocals_dir.glob("*.wav"))
+    if not files:
+        raise FileNotFoundError("No vocal segments were generated for VoxCPM references.")
+
+    global_fallback = _first_reference(files, min_ms) or files[0]
+    speaker_files: dict[str, list[Path]] = {}
+    for index, item in enumerate(items, start=1):
+        reference = vocals_dir / f"{index:04d}.wav"
+        if reference.exists():
+            speaker_files.setdefault(_speaker(item), []).append(reference)
+
+    fallbacks: dict[str, Path] = {}
+    for speaker, refs in speaker_files.items():
+        fallback = _first_reference(refs, min_ms)
+        if fallback is not None:
+            fallbacks[speaker] = fallback
+
+    return fallbacks, global_fallback
 
 
 def _tts_text(item: dict) -> str:
@@ -83,11 +111,11 @@ def generate_tts(
 
     model = _load_model()
     min_reference_ms = int(os.getenv("VOXCPM_MIN_REFERENCE_MS", "1200"))
-    fallback = _fallback_reference(vocals_dir, min_reference_ms)
+    fallback_references, global_fallback = _fallback_references(vocals_dir, items, min_reference_ms)
     cfg_value = float(os.getenv("VOXCPM_CFG_VALUE", "2.0"))
     inference_timesteps = int(os.getenv("VOXCPM_INFERENCE_TIMESTEPS", "10"))
 
-    fallback_cache = None
+    fallback_caches = {}
 
     for index, item in enumerate(items, start=1):
         output_file = output_dir / f"{index:04d}.wav"
@@ -95,13 +123,15 @@ def generate_tts(
             reference = vocals_dir / f"{index:04d}.wav"
             text = _tts_text(item)
             if not reference.exists() or len(AudioSegment.from_file(reference)) < min_reference_ms:
-                if fallback_cache is None:
-                    fallback_cache = model.tts_model.build_prompt_cache(
+                speaker = _speaker(item)
+                if speaker not in fallback_caches:
+                    fallback = fallback_references.get(speaker, global_fallback)
+                    fallback_caches[speaker] = model.tts_model.build_prompt_cache(
                         reference_wav_path=str(fallback)
                     )
                 result = model.tts_model.generate_with_prompt_cache(
                     target_text=text,
-                    prompt_cache=fallback_cache,
+                    prompt_cache=fallback_caches[speaker],
                     cfg_value=cfg_value,
                     inference_timesteps=inference_timesteps,
                     **_PROMPT_CACHE_GENERATION_DEFAULTS,
