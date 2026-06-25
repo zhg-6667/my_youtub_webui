@@ -167,7 +167,7 @@ def test_translate_asr_invokes_translate_batch_with_all_texts_at_once(tmp_path, 
 
 
 def test_translate_batch_replaces_em_dash_for_zh_target(monkeypatch):
-    monkeypatch.setattr(openai_translate, "_call_json", lambda *a, **kw: {"dst": "你好——世界"})
+    monkeypatch.setattr(openai_translate, "_call_json", lambda *a, **kw: {"items": ["你好——世界"]})
     monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
 
     out = openai_translate.translate_batch(
@@ -179,7 +179,7 @@ def test_translate_batch_replaces_em_dash_for_zh_target(monkeypatch):
 
 def test_translate_batch_does_not_replace_em_dash_for_en_target(monkeypatch):
     monkeypatch.setattr(
-        openai_translate, "_call_json", lambda *a, **kw: {"dst": "He said—wait—and left."}
+        openai_translate, "_call_json", lambda *a, **kw: {"items": ["He said—wait—and left."]}
     )
     monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
 
@@ -197,7 +197,8 @@ def test_translate_batch_uses_shared_system_prompt(monkeypatch):
     def fake_call_json(client, model, system, user):
         with lock:
             captured.append(system)
-        return {"dst": f"dst:{user}"}
+        lines = user.strip().split("\n")
+        return {"items": [f"dst:{line.split('. ', 1)[1]}" for line in lines]}
 
     monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
     monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
@@ -205,10 +206,11 @@ def test_translate_batch_uses_shared_system_prompt(monkeypatch):
     texts = [f"s{i}" for i in range(5)]
     out = openai_translate.translate_batch(
         texts, BB_SOURCE, {}, PreprocessResponse(),
-        base_url="u", api_key="k", model="m", concurrency=4,
+        base_url="u", api_key="k", model="m", concurrency=4, batch_size=2,
     )
     assert out == [f"dst:s{i}" for i in range(5)]
     assert len(set(captured)) == 1, "system prompt must be identical across calls for prompt cache"
+    assert len(captured) == 3, "5 sentences with batch_size=2 must use 3 requests, not 5"
 
 
 @pytest.mark.parametrize("value", ["abc", "1.5", "0", "-1", "201", ""])
@@ -221,7 +223,7 @@ def test_translate_sentence_retries_on_empty_dst(monkeypatch):
 
     def fake_call_json(client, model, system, user):
         calls["n"] += 1
-        return {"dst": ""} if calls["n"] == 1 else {"dst": "ok"}
+        return {"items": [""]} if calls["n"] == 1 else {"items": ["ok"]}
 
     monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
 
@@ -236,7 +238,7 @@ def test_translate_sentence_raises_after_retries(monkeypatch):
 
     monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
 
-    with pytest.raises(RuntimeError, match="translate_sentence failed"):
+    with pytest.raises(RuntimeError, match="translate chunk failed"):
         openai_translate.translate_sentence("x", "en", object(), "m", "sys")
 
 
@@ -268,3 +270,81 @@ def test_translate_system_prompt_contains_meta_summary_hotwords(monkeypatch):
     assert "Long description" in system
     assert "Recap of the talk." in system
     assert "LEGO -> 乐高" in system
+
+
+def test_translate_batch_sends_one_request_per_chunk(monkeypatch):
+    requests: list[int] = []
+    lock = __import__("threading").Lock()
+
+    def fake_call_json(client, model, system, user):
+        lines = user.strip().split("\n")
+        with lock:
+            requests.append(len(lines))
+        return {"items": [f"t{line.split('. ', 1)[1]}" for line in lines]}
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    texts = [f"s{i}" for i in range(7)]
+    out = openai_translate.translate_batch(
+        texts, BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", batch_size=3,
+    )
+    assert out == [f"ts{i}" for i in range(7)]
+    assert sorted(requests) == [1, 3, 3], "7 sentences with batch_size=3 -> chunks of 3,3,1"
+
+
+def test_translate_batch_falls_back_to_per_sentence_when_batch_misaligns(monkeypatch):
+    def fake_call_json(client, model, system, user):
+        lines = user.strip().split("\n")
+        if len(lines) > 1:
+            # misbehaving model: wrong item count for a multi-sentence batch
+            return {"items": ["only-one"]}
+        return {"items": [f"solo:{lines[0].split('. ', 1)[1]}"]}
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    texts = ["a", "b", "c"]
+    out = openai_translate.translate_batch(
+        texts, BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", batch_size=3,
+    )
+    assert out == ["solo:a", "solo:b", "solo:c"]
+
+
+def test_translate_chunk_merges_single_sentence_split_into_clauses_zh(monkeypatch):
+    monkeypatch.setattr(
+        openai_translate, "_call_json", lambda *a, **kw: {"items": ["前半句，", "后半句。"]}
+    )
+    out = openai_translate.translate_sentence("a long source sentence", "zh", object(), "m", "sys")
+    assert out == "前半句，后半句。"
+
+
+def test_translate_chunk_merges_single_sentence_split_into_clauses_en(monkeypatch):
+    monkeypatch.setattr(
+        openai_translate, "_call_json", lambda *a, **kw: {"items": ["First part,", "second part."]}
+    )
+    out = openai_translate.translate_sentence("一个很长的句子", "en", object(), "m", "sys")
+    assert out == "First part, second part."
+
+
+def test_translate_batch_accepts_top_level_json_array(monkeypatch):
+    # model returns a bare JSON array instead of {"items": [...]}
+    def fake_call_json(client, model, system, user):
+        lines = user.strip().split("\n")
+        return [f"arr:{line.split('. ', 1)[1]}" for line in lines]
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    out = openai_translate.translate_batch(
+        ["a", "b", "c"], BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", batch_size=3,
+    )
+    assert out == ["arr:a", "arr:b", "arr:c"]
+
+
+def test_extract_json_parses_bare_and_noisy_arrays():
+    assert openai_translate._extract_json('["x", "y"]') == ["x", "y"]
+    assert openai_translate._extract_json('结果：\n["x", "y"]\ndone') == ["x", "y"]
