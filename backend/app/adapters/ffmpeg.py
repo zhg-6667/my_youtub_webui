@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from ..config import ffmpeg_binary, ffprobe_binary
@@ -247,6 +249,54 @@ def subtitle_filter(video_file: Path, subtitle_file: Path, session: Path) -> str
     return f"subtitles=filename='{sub_path}':force_style='{style}'"
 
 
+def _nvenc_available() -> bool:
+    try:
+        result = subprocess.run(
+            [ffmpeg_binary(), "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "h264_nvenc" in result.stdout
+
+
+def _video_encoders() -> list[list[str]]:
+    nvenc = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"]
+    libx264 = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+    choice = os.getenv("VIDEO_ENCODER", "auto").strip().lower()
+    if choice == "libx264":
+        return [libx264]
+    if choice in ("nvenc", "h264_nvenc"):
+        return [nvenc]
+    # auto: prefer NVENC when ffmpeg supports it, fall back to libx264 on failure.
+    if _nvenc_available():
+        return [nvenc, libx264]
+    return [libx264]
+
+
+def _probe_duration(video_file: Path) -> float | None:
+    """Return video duration in seconds, or None on failure."""
+    result = subprocess.run(
+        [
+            ffprobe_binary(),
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            str(video_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip())
+    except (ValueError, TypeError):
+        return None
+
+
 def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_file: Path, session: Path) -> Path:
     tmp_dir = session / "tmp"
     media_dir = session / "media"
@@ -282,34 +332,52 @@ def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_fi
         ],
         check=True,
     )
-    subprocess.run(
-        [
-            ffmpeg_binary(),
-            "-y",
-            "-i",
-            str(video_input),
-            "-i",
-            str(mixed_audio_output),
-            "-vf",
-            subtitle_filter(video_input, subtitles, session_dir),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            str(final_video_output),
-        ],
-        check=True,
-        cwd=session_dir,
-    )
-    return final_video
+    vf = subtitle_filter(video_input, subtitles, session_dir)
+    encoders = _video_encoders()
+    duration = _probe_duration(video_input)
+    timeout = max(600, int((duration or 1800) * 3))
+    last_error: subprocess.SubprocessError | None = None
+    for index, video_codec in enumerate(encoders):
+        try:
+            subprocess.run(
+                [
+                    ffmpeg_binary(),
+                    "-y",
+                    "-i",
+                    str(video_input),
+                    "-i",
+                    str(mixed_audio_output),
+                    "-vf",
+                    vf,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    *video_codec,
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    "-shortest",
+                    str(final_video_output),
+                ],
+                check=True,
+                timeout=timeout,
+                cwd=session_dir,
+            )
+            return final_video
+        except subprocess.SubprocessError as error:
+            last_error = error
+            detail = (
+                f"timed out after {timeout}s"
+                if isinstance(error, subprocess.TimeoutExpired)
+                else getattr(error, "stderr", "") or str(error)
+            )
+            if index + 1 < len(encoders):
+                print(
+                    f"[ffmpeg] video encoder {video_codec[1]} failed ({detail}), "
+                    f"falling back to {encoders[index + 1][1]}",
+                    file=sys.stderr,
+                )
+    assert last_error is not None
+    raise last_error

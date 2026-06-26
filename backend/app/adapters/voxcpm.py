@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -10,6 +12,8 @@ import soundfile as sf
 from pydub import AudioSegment
 
 from ..config import MODEL_CACHE_DIR
+
+logger = logging.getLogger(__name__)
 
 _MODEL = None
 
@@ -117,12 +121,18 @@ def generate_tts(
 
     fallback_caches = {}
 
+    fallback_count = 0
+    normal_count = 0
+    total_tts_time = 0.0
+
     for index, item in enumerate(items, start=1):
         output_file = output_dir / f"{index:04d}.wav"
         if not output_file.exists():
             reference = vocals_dir / f"{index:04d}.wav"
             text = _tts_text(item)
+            t_start = time.perf_counter()
             if not reference.exists() or len(AudioSegment.from_file(reference)) < min_reference_ms:
+                fallback_count += 1
                 speaker = _speaker(item)
                 if speaker not in fallback_caches:
                     fallback = fallback_references.get(speaker, global_fallback)
@@ -139,15 +149,31 @@ def generate_tts(
                 wav_tensor, _, _ = result
                 wav = wav_tensor.squeeze(0).cpu().numpy()
             else:
+                normal_count += 1
                 wav = model.generate(
                     text=text,
                     reference_wav_path=str(reference),
                     cfg_value=cfg_value,
                     inference_timesteps=inference_timesteps,
                 )
+            elapsed = time.perf_counter() - t_start
+            total_tts_time += elapsed
             sf.write(output_file, wav, model.tts_model.sample_rate)
         if progress_callback:
             progress = round(index / total * 100)
             progress_callback(progress, f"Prepared {index}/{total} TTS clips")
+
+    avg_ms = (total_tts_time / max(total, 1)) * 1000
+    logger.info(
+        "TTS summary: %d items | normal=%d fallback=%d | total=%.1fs avg=%dms/item",
+        total, normal_count, fallback_count, total_tts_time, round(avg_ms),
+    )
+    if fallback_count > 0:
+        logger.info(
+            "TTS fallback rate: %d/%d (%.1f%%) — retry_badcase_max_times=%d",
+            fallback_count, total,
+            fallback_count / max(total, 1) * 100,
+            _PROMPT_CACHE_GENERATION_DEFAULTS["retry_badcase_max_times"],
+        )
 
     return output_dir

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Callable
@@ -40,7 +41,7 @@ def separate_audio(
     if vocals_file.exists() and bgm_file.exists():
         return vocals_file, bgm_file
 
-    shifts = 3
+    shifts = int(os.getenv("DEMUCS_SHIFTS", "1"))
 
     def report_progress(info: dict) -> None:
         if progress_callback is None:
@@ -49,7 +50,7 @@ def separate_audio(
         progress_callback(progress, f"Separating audio {progress}%")
 
     separator = Separator(
-        model="htdemucs_ft",
+        model=os.getenv("DEMUCS_MODEL", "htdemucs"),
         device=_device(),
         progress=True,
         shifts=shifts,

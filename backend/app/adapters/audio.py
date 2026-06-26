@@ -35,8 +35,8 @@ def split_audio_by_translation(vocals_file: Path, translation_file: Path, sessio
 
 
 def _audio_duration(file: Path) -> tuple[float, int]:
-    y, sr = librosa.load(str(file), sr=None)
-    return len(y) / sr, sr
+    info = sf.info(str(file))
+    return info.frames / info.samplerate, info.samplerate
 
 
 def _base_speed_factor(translation: list[dict], tts_files: list[Path]) -> float:
