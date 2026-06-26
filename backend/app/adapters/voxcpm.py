@@ -119,10 +119,25 @@ def generate_tts(
     cfg_value = float(os.getenv("VOXCPM_CFG_VALUE", "2.0"))
     inference_timesteps = int(os.getenv("VOXCPM_INFERENCE_TIMESTEPS", "10"))
 
-    fallback_caches = {}
+    # When VOXCPM_USE_SPEAKER_CACHE=true, pre-build one prompt cache per speaker and route
+    # ALL sentences through generate_with_prompt_cache, skipping per-sentence reference encoding.
+    # Trade-off: slightly less per-sentence voice variation; suitable for single-speaker videos.
+    use_speaker_cache = os.getenv("VOXCPM_USE_SPEAKER_CACHE", "false").lower() == "true"
 
-    fallback_count = 0
-    normal_count = 0
+    fallback_caches: dict[str, object] = {}
+    global_cache: object = None
+
+    if use_speaker_cache:
+        speakers = {_speaker(it) for it in items}
+        logger.info("VOXCPM_USE_SPEAKER_CACHE: pre-building prompt cache for %d speaker(s)...", len(speakers))
+        for spk in speakers:
+            ref = fallback_references.get(spk, global_fallback)
+            fallback_caches[spk] = model.tts_model.build_prompt_cache(reference_wav_path=str(ref))
+        global_cache = model.tts_model.build_prompt_cache(reference_wav_path=str(global_fallback))
+        logger.info("VOXCPM_USE_SPEAKER_CACHE: prompt caches ready")
+
+    cache_path_count = 0
+    direct_path_count = 0
     total_tts_time = 0.0
 
     for index, item in enumerate(items, start=1):
@@ -131,17 +146,27 @@ def generate_tts(
             reference = vocals_dir / f"{index:04d}.wav"
             text = _tts_text(item)
             t_start = time.perf_counter()
-            if not reference.exists() or len(AudioSegment.from_file(reference)) < min_reference_ms:
-                fallback_count += 1
+            needs_cache = (
+                use_speaker_cache
+                or not reference.exists()
+                or len(AudioSegment.from_file(reference)) < min_reference_ms
+            )
+            if needs_cache:
+                cache_path_count += 1
                 speaker = _speaker(item)
                 if speaker not in fallback_caches:
-                    fallback = fallback_references.get(speaker, global_fallback)
+                    ref = fallback_references.get(speaker, global_fallback)
                     fallback_caches[speaker] = model.tts_model.build_prompt_cache(
-                        reference_wav_path=str(fallback)
+                        reference_wav_path=str(ref)
                     )
+                if global_cache is None:
+                    global_cache = model.tts_model.build_prompt_cache(
+                        reference_wav_path=str(global_fallback)
+                    )
+                cache = fallback_caches.get(speaker) or global_cache
                 result = model.tts_model.generate_with_prompt_cache(
                     target_text=text,
-                    prompt_cache=fallback_caches[speaker],
+                    prompt_cache=cache,
                     cfg_value=cfg_value,
                     inference_timesteps=inference_timesteps,
                     **_PROMPT_CACHE_GENERATION_DEFAULTS,
@@ -149,7 +174,7 @@ def generate_tts(
                 wav_tensor, _, _ = result
                 wav = wav_tensor.squeeze(0).cpu().numpy()
             else:
-                normal_count += 1
+                direct_path_count += 1
                 wav = model.generate(
                     text=text,
                     reference_wav_path=str(reference),
@@ -165,14 +190,16 @@ def generate_tts(
 
     avg_ms = (total_tts_time / max(total, 1)) * 1000
     logger.info(
-        "TTS summary: %d items | normal=%d fallback=%d | total=%.1fs avg=%dms/item",
-        total, normal_count, fallback_count, total_tts_time, round(avg_ms),
+        "TTS summary: %d items | direct=%d cache=%d | speaker_cache=%s | total=%.1fs avg=%dms/item",
+        total, direct_path_count, cache_path_count,
+        "on" if use_speaker_cache else "off",
+        total_tts_time, round(avg_ms),
     )
-    if fallback_count > 0:
+    if cache_path_count > 0 and not use_speaker_cache:
         logger.info(
-            "TTS fallback rate: %d/%d (%.1f%%) — retry_badcase_max_times=%d",
-            fallback_count, total,
-            fallback_count / max(total, 1) * 100,
+            "TTS reference fallback rate: %d/%d (%.1f%%) — retry_badcase_max_times=%d",
+            cache_path_count, total,
+            cache_path_count / max(total, 1) * 100,
             _PROMPT_CACHE_GENERATION_DEFAULTS["retry_badcase_max_times"],
         )
 
