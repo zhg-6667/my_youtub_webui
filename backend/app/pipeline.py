@@ -399,10 +399,19 @@ class PipelineRunner:
 
     def _tts(self, _: dict) -> None:
         from .adapters.voxcpm import generate_tts
+        from .adapters.whisper_asr import unload_model as unload_whisper
+        from .gpu import free_gpu_memory, gpu_memory_status
 
         session = _require(self.artifacts.session, "session")
         translation_file = _require(self.artifacts.translation_file, "translation_file")
         vocals_dir = _require(self.artifacts.vocals_dir, "vocals_dir")
+
+        before = gpu_memory_status()
+        unload_whisper()
+        free_gpu_memory("before tts")
+        if before is not None:
+            self.stage_message("tts", f"Freed GPU memory before TTS: {before} -> {gpu_memory_status()}")
+
         self.artifacts.tts_dir = generate_tts(
             translation_file,
             vocals_dir,

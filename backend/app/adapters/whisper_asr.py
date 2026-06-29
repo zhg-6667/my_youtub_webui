@@ -58,6 +58,12 @@ def _load_model():
     return _MODEL
 
 
+def unload_model() -> None:
+    """Drop the resident Whisper model so its VRAM can be reclaimed."""
+    global _MODEL
+    _MODEL = None
+
+
 def _to_ms(seconds: float) -> int:
     return int(round(float(seconds) * 1000))
 
