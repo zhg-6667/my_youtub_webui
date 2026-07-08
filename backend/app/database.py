@@ -64,6 +64,22 @@ def init_db() -> None:
               value TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS bilibili_upload_jobs (
+              id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              publish_mode TEXT NOT NULL,
+              dtime TEXT,
+              status TEXT NOT NULL,
+              log_path TEXT,
+              error_message TEXT,
+              return_code INTEGER,
+              created_at TEXT NOT NULL,
+              started_at TEXT,
+              completed_at TEXT,
+              FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
             """
         )
         defaults = openai_defaults()
@@ -243,6 +259,7 @@ def delete_task(task_id: str) -> bool:
     with connect() as conn:
         cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         conn.execute("DELETE FROM task_stages WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM bilibili_upload_jobs WHERE task_id = ?", (task_id,))
         return cursor.rowcount > 0
 
 
@@ -391,7 +408,87 @@ def save_ytdlp_settings(proxy_port: str) -> None:
     set_setting("ytdlp.proxy_port", proxy_port.strip())
 
 
+
 def log_path(task_id: str) -> Path:
     from .config import LOG_DIR
 
     return LOG_DIR / f"{task_id}.log"
+
+
+BILIBILI_UPLOAD_ACTIVE_STATUSES = ("queued", "running")
+
+
+def bilibili_upload_log_path(job_id: str) -> Path:
+    from .config import LOG_DIR
+
+    return LOG_DIR / f"bilibili-upload-{job_id}.log"
+
+
+def create_bilibili_upload_job(
+    task_id: str,
+    *,
+    title: str,
+    publish_mode: str,
+    dtime: str | None = None,
+    job_id: str | None = None,
+) -> str:
+    new_id = job_id or str(uuid.uuid4())
+    log = bilibili_upload_log_path(new_id)
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO bilibili_upload_jobs (
+              id, task_id, title, publish_mode, dtime, status, log_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+            """,
+            (new_id, task_id, title, publish_mode, dtime, str(log), now_iso()),
+        )
+    return new_id
+
+
+def get_bilibili_upload_job(job_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM bilibili_upload_jobs WHERE id = ?", (job_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_active_bilibili_upload_job(task_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT * FROM bilibili_upload_jobs
+            WHERE task_id = ? AND status IN ({','.join('?' for _ in BILIBILI_UPLOAD_ACTIVE_STATUSES)})
+            ORDER BY created_at DESC, rowid DESC LIMIT 1
+            """,
+            (task_id, *BILIBILI_UPLOAD_ACTIVE_STATUSES),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_queued_bilibili_upload_jobs() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bilibili_upload_jobs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def fail_stale_running_bilibili_upload_jobs() -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE bilibili_upload_jobs
+            SET status = 'failed', error_message = ?, completed_at = ?
+            WHERE status = 'running'
+            """,
+            ("Backend restarted before the Bilibili upload completed.", now_iso()),
+        )
+
+
+def update_bilibili_upload_job(job_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    values = list(fields.values()) + [job_id]
+    with connect() as conn:
+        conn.execute(f"UPDATE bilibili_upload_jobs SET {assignments} WHERE id = ?", values)
