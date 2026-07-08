@@ -51,6 +51,12 @@ def _load_model():
     return _MODEL
 
 
+def unload_model() -> None:
+    """Drop the resident VoxCPM model so its VRAM can be reclaimed."""
+    global _MODEL
+    _MODEL = None
+
+
 def _first_reference(files: list[Path], min_ms: int) -> Path | None:
     for path in files:
         if len(AudioSegment.from_file(path)) >= min_ms:

@@ -381,3 +381,118 @@ def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_fi
                 )
     assert last_error is not None
     raise last_error
+
+
+def _keep_intervals(cuts: list[dict], total_duration: float) -> list[tuple[float, float]]:
+    """Invert cut intervals into keep intervals, clamped to [0, total_duration]."""
+    if not cuts:
+        return [(0, total_duration)]
+
+    normalized: list[tuple[float, float]] = []
+    for c in cuts:
+        start = float(max(0, c.get("start", 0)))
+        end = float(min(total_duration, c.get("end", total_duration)))
+        if end > start:
+            normalized.append((start, end))
+    normalized.sort(key=lambda x: x[0])
+
+    merged: list[tuple[float, float]] = []
+    for s, e in normalized:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    keep: list[tuple[float, float]] = []
+    cursor = 0.0
+    for s, e in merged:
+        if s > cursor:
+            keep.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < total_duration:
+        keep.append((cursor, total_duration))
+    return keep
+
+
+def trim_video(input_video: Path, cut_intervals: list[dict], session: Path) -> Path:
+    """Cut intervals from the final video, output as a separate trimmed file.
+
+    cut_intervals: [{"start": 120.0, "end": 180.0}, ...] in seconds.
+    Returns path to video_final_trimmed.mp4 (or the original if nothing to cut).
+    """
+    media_dir = session / "media"
+    output_video = media_dir / "video_final_trimmed.mp4"
+    if output_video.exists():
+        return output_video
+
+    if not cut_intervals:
+        return input_video
+
+    duration = _probe_duration(input_video)
+    if duration is None:
+        raise RuntimeError(f"Cannot probe duration of {input_video}")
+
+    keep = _keep_intervals(cut_intervals, duration)
+    if not keep:
+        return input_video
+    if len(keep) == 1 and keep[0] == (0, duration):
+        return input_video
+
+    session_dir = session.resolve()
+    input_resolved = input_video.resolve()
+    output_resolved = output_video.resolve()
+
+    trim_filters: list[str] = []
+    concat_inputs: list[str] = []
+    for i, (start, end) in enumerate(keep):
+        trim_filters.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];")
+        trim_filters.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}];")
+        concat_inputs.append(f"[v{i}][a{i}]")
+
+    n = len(keep)
+    filter_graph = "".join(trim_filters) + f"{''.join(concat_inputs)}concat=n={n}:v=1:a=1[outv][outa]"
+
+    encoders = _video_encoders()
+    timeout = max(600, int(duration * 3))
+    last_error: subprocess.SubprocessError | None = None
+    for index, video_codec in enumerate(encoders):
+        try:
+            subprocess.run(
+                [
+                    ffmpeg_binary(),
+                    "-y",
+                    "-i",
+                    str(input_resolved),
+                    "-filter_complex",
+                    filter_graph,
+                    "-map",
+                    "[outv]",
+                    "-map",
+                    "[outa]",
+                    *video_codec,
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    str(output_resolved),
+                ],
+                check=True,
+                timeout=timeout,
+                cwd=session_dir,
+            )
+            return output_video
+        except subprocess.SubprocessError as error:
+            last_error = error
+            detail = (
+                f"timed out after {timeout}s"
+                if isinstance(error, subprocess.TimeoutExpired)
+                else getattr(error, "stderr", "") or str(error)
+            )
+            if index + 1 < len(encoders):
+                print(
+                    f"[ffmpeg] trim_video encoder {video_codec[1]} failed ({detail}), "
+                    f"falling back to {encoders[index + 1][1]}",
+                    file=sys.stderr,
+                )
+    assert last_error is not None
+    raise last_error

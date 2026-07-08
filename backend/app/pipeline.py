@@ -30,6 +30,7 @@ class PipelineArtifacts:
     dubbing_file: Path | None = None
     timings_file: Path | None = None
     final_video: Path | None = None
+    trimmed_video: Path | None = None
 
 
 def _write_log(task_id: str, message: str) -> None:
@@ -68,6 +69,7 @@ class PipelineRunner:
             "tts": self._tts,
             "merge_audio": self._merge_audio,
             "merge_video": self._merge_video,
+            "trim_video": self._trim_video,
         }
 
     def run(self) -> None:
@@ -109,7 +111,7 @@ class PipelineRunner:
                 self.task_id,
                 status="succeeded",
                 current_stage="done",
-                final_video_path=str(_require(self.artifacts.final_video, "final_video")),
+                final_video_path=str(_require(self.artifacts.trimmed_video or self.artifacts.final_video, "final_video")),
                 completed_at=database.now_iso(),
             )
             self.log("Task succeeded")
@@ -258,6 +260,12 @@ class PipelineRunner:
         if stage == "merge_video":
             self.artifacts.final_video = _require_existing(session / "media" / "video_final.mp4", "final_video")
             return
+        if stage == "trim_video":
+            self.artifacts.final_video = _require_existing(session / "media" / "video_final.mp4", "final_video")
+            trimmed = session / "media" / "video_final_trimmed.mp4"
+            if trimmed.exists():
+                self.artifacts.trimmed_video = trimmed
+            return
         raise RuntimeError(f"Unknown pipeline stage: {stage}")
 
     def _download(self, task: dict) -> None:
@@ -279,6 +287,7 @@ class PipelineRunner:
 
     def _separate(self, _: dict) -> None:
         from .adapters.demucs import separate_audio
+        from .gpu import free_gpu_memory, gpu_memory_status
 
         session = _require(self.artifacts.session, "session")
         video_file = _require(self.artifacts.video_file, "video_file")
@@ -288,6 +297,11 @@ class PipelineRunner:
             progress_callback=lambda progress, message: self.stage_progress("separate", progress, message),
         )
         self.stage_message("separate", f"Vocals: {self.artifacts.vocals_file.name}, BGM: {self.artifacts.bgm_file.name}")
+
+        after = gpu_memory_status()
+        free_gpu_memory("after separate")
+        if after is not None:
+            self.stage_message("separate", f"Freed GPU memory after separate: {after} -> {gpu_memory_status()}")
 
     def _asr(self, task: dict) -> None:
         import json as _json
@@ -421,6 +435,14 @@ class PipelineRunner:
         wav_count = len(list(self.artifacts.tts_dir.glob("*.wav")))
         self.stage_message("tts", f"Generated {wav_count} TTS clips -> {self.artifacts.tts_dir}")
 
+        from .adapters.voxcpm import unload_model as unload_voxcpm
+
+        after = gpu_memory_status()
+        unload_voxcpm()
+        free_gpu_memory("after tts")
+        if after is not None:
+            self.stage_message("tts", f"Freed GPU memory after TTS: {after} -> {gpu_memory_status()}")
+
     def _merge_audio(self, _: dict) -> None:
         from .adapters.audio import merge_tts_audio
 
@@ -443,6 +465,34 @@ class PipelineRunner:
         self.artifacts.final_video = merge_video(video_file, dubbing_file, bgm_file, timings_file, session)
         size_mb = self.artifacts.final_video.stat().st_size / (1024 * 1024)
         self.stage_message("merge_video", f"Final video: {self.artifacts.final_video} ({size_mb:.1f} MB)")
+
+    def _trim_video(self, _: dict) -> None:
+        import json as _json
+
+        from .adapters.ffmpeg import trim_video
+
+        session = _require(self.artifacts.session, "session")
+        final_video = _require(self.artifacts.final_video, "final_video")
+
+        intervals_file = session / "metadata" / "cut_intervals.json"
+        if not intervals_file.exists():
+            self.artifacts.trimmed_video = final_video
+            self.stage_message("trim_video", "No cut intervals; keeping original video")
+            return
+
+        cut_intervals = _json.loads(intervals_file.read_text(encoding="utf-8"))
+        if not cut_intervals:
+            self.artifacts.trimmed_video = final_video
+            self.stage_message("trim_video", "Empty cut intervals; keeping original video")
+            return
+
+        self.stage_message(
+            "trim_video",
+            f"Cutting {len(cut_intervals)} intervals: {_json.dumps(cut_intervals)}",
+        )
+        self.artifacts.trimmed_video = trim_video(final_video, cut_intervals, session)
+        size_mb = self.artifacts.trimmed_video.stat().st_size / (1024 * 1024)
+        self.stage_message("trim_video", f"Trimmed video: {self.artifacts.trimmed_video} ({size_mb:.1f} MB)")
 
 
 def run_task(task_id: str) -> None:

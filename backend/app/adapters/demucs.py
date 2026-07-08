@@ -67,6 +67,9 @@ def separate_audio(
 
     save_audio(vocals, str(vocals_file), samplerate=separator.samplerate)
     save_audio(bgm, str(bgm_file), samplerate=separator.samplerate)
+
+    del separator
+
     return vocals_file, bgm_file
 
 

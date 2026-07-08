@@ -1,7 +1,7 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { use, useEffect, useMemo, useState } from "react"
+import { use, useEffect, useMemo, useState, FormEvent } from "react"
 import {
   CheckCircle2,
   Circle,
@@ -10,23 +10,29 @@ import {
   Loader2,
   Play,
   RotateCw,
+  Send,
   Trash2,
   XCircle,
 } from "lucide-react"
 
 import {
+  BilibiliPublishMode,
+  BilibiliUploadJob,
   ExecutionMode,
   StageStatus,
   Task,
   continueTask,
+  createBilibiliUploadJob,
   deleteTask,
   finalVideoDownloadUrl,
   finalVideoUrl,
+  getBilibiliUploadJob,
   getTask,
   getTaskLog,
   redoStage,
   rerunTask,
   resumeTask,
+  trimVideo,
 } from "@/lib/api"
 import { useI18n } from "@/lib/i18n"
 import { statusBadgeClass } from "@/lib/status"
@@ -51,6 +57,15 @@ import {
 } from "@/components/ui/dialog"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 
 function stageIcon(status: StageStatus) {
   if (status === "succeeded") return <CheckCircle2 className="size-5 text-[#00aeec]" />
@@ -103,6 +118,15 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [redoingStage, setRedoingStage] = useState<string | null>(null)
   const [redoConfirmStage, setRedoConfirmStage] = useState<string | null>(null)
   const [redoError, setRedoError] = useState("")
+  const [trimming, setTrimming] = useState(false)
+  const [trimError, setTrimError] = useState("")
+  const [bilibiliOpen, setBilibiliOpen] = useState(false)
+  const [bilibiliTitle, setBilibiliTitle] = useState("")
+  const [bilibiliPublishMode, setBilibiliPublishMode] = useState<BilibiliPublishMode>("now")
+  const [bilibiliDtime, setBilibiliDtime] = useState("")
+  const [creatingBilibiliJob, setCreatingBilibiliJob] = useState(false)
+  const [bilibiliJob, setBilibiliJob] = useState<BilibiliUploadJob | null>(null)
+  const [bilibiliError, setBilibiliError] = useState("")
 
   const handleDelete = async () => {
     setDeleting(true)
@@ -178,12 +202,54 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     if (succeeded) setRedoConfirmStage(null)
   }
 
+  const handleTrim = async () => {
+    setTrimming(true)
+    setTrimError("")
+    try {
+      const next = await trimVideo(id)
+      setTask(next)
+    } catch (err) {
+      setTrimError(err instanceof Error ? err.message : t.task.trimStageError)
+    } finally {
+      setTrimming(false)
+    }
+  }
+
+  const handleCreateBilibiliUpload = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setBilibiliError("")
+    const title = bilibiliTitle.trim()
+    if (!title) {
+      setBilibiliError(t.task.bilibiliTitleRequired)
+      return
+    }
+    if (bilibiliPublishMode === "scheduled" && !bilibiliDtime) {
+      setBilibiliError(t.task.bilibiliDtimeRequired)
+      return
+    }
+    setCreatingBilibiliJob(true)
+    try {
+      const job = await createBilibiliUploadJob(id, {
+        title,
+        publish_mode: bilibiliPublishMode,
+        dtime: bilibiliPublishMode === "scheduled" ? bilibiliDtime : null,
+      })
+      setBilibiliJob(job)
+      setBilibiliOpen(false)
+    } catch (err) {
+      setBilibiliError(err instanceof Error ? err.message : t.task.bilibiliUploadError)
+    } finally {
+      setCreatingBilibiliJob(false)
+    }
+  }
+
   const isRunning = task?.status === "running"
   const isQueued = task?.status === "queued"
   const isFailed = task?.status === "failed"
   const isPaused = task?.status === "paused"
   const isManual = task?.execution_mode === "manual"
   const canRedoStage = isManual && !isRunning && !isQueued
+  const canTrim = !isRunning && !isQueued
   const redoConfirmStageInfo = task?.stages.find((stage) => stage.name === redoConfirmStage)
 
   useEffect(() => {
@@ -207,6 +273,24 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
       window.clearInterval(interval)
     }
   }, [id, t.task.loadError])
+
+  useEffect(() => {
+    if (!bilibiliJob || !["queued", "running"].includes(bilibiliJob.status)) return
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const next = await getBilibiliUploadJob(bilibiliJob.id)
+        if (!cancelled) setBilibiliJob(next)
+      } catch (err) {
+        if (!cancelled) setBilibiliError(err instanceof Error ? err.message : t.task.bilibiliUploadError)
+      }
+    }
+    const interval = window.setInterval(refresh, 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [bilibiliJob, t.task.bilibiliUploadError])
 
   const progress = useMemo(() => {
     if (!task?.stages?.length) return 0
@@ -294,10 +378,102 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                 className="w-full rounded-md border border-emerald-200 bg-black"
               />
               <p className="break-all text-xs text-muted-foreground">{task.final_video_path}</p>
-              <Button nativeButton={false} render={<a href={finalVideoDownloadUrl(task.id)} />}>
-                <Download className="size-4" />
-                {t.task.download}
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button nativeButton={false} render={<a href={finalVideoDownloadUrl(task.id)} />}>
+                  <Download className="size-4" />
+                  {t.task.download}
+                </Button>
+                <Dialog open={bilibiliOpen} onOpenChange={setBilibiliOpen}>
+                  <DialogTrigger
+                    render={
+                      <Button variant="outline">
+                        <Send className="size-4" />
+                        {t.task.publishBilibili}
+                      </Button>
+                    }
+                  />
+                  <DialogContent>
+                    <form onSubmit={handleCreateBilibiliUpload} className="space-y-4">
+                      <DialogHeader>
+                        <DialogTitle>{t.task.publishBilibiliTitle}</DialogTitle>
+                        <DialogDescription>{t.task.publishBilibiliDescription}</DialogDescription>
+                      </DialogHeader>
+                      <div className="space-y-2">
+                        <Label htmlFor="bilibili-title">{t.task.bilibiliTitleLabel}</Label>
+                        <Input
+                          id="bilibili-title"
+                          value={bilibiliTitle}
+                          onChange={(event) => setBilibiliTitle(event.target.value)}
+                          placeholder={task.title || t.task.bilibiliTitlePlaceholder}
+                          disabled={creatingBilibiliJob}
+                        />
+                        <p className="text-xs text-muted-foreground">{t.task.bilibiliTitleHelp}</p>
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="bilibili-publish-mode">{t.task.bilibiliPublishMode}</Label>
+                        <Select
+                          value={bilibiliPublishMode}
+                          onValueChange={(value) => setBilibiliPublishMode(value as BilibiliPublishMode)}
+                          disabled={creatingBilibiliJob}
+                        >
+                          <SelectTrigger id="bilibili-publish-mode" className="h-10">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="now">{t.task.publishNow}</SelectItem>
+                            <SelectItem value="scheduled">{t.task.publishScheduled}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      {bilibiliPublishMode === "scheduled" ? (
+                        <div className="space-y-2">
+                          <Label htmlFor="bilibili-dtime">{t.task.scheduledPublishTime}</Label>
+                          <Input
+                            id="bilibili-dtime"
+                            type="datetime-local"
+                            value={bilibiliDtime}
+                            onChange={(event) => setBilibiliDtime(event.target.value)}
+                            disabled={creatingBilibiliJob}
+                          />
+                        </div>
+                      ) : null}
+                      {bilibiliError ? (
+                        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                          {bilibiliError}
+                        </div>
+                      ) : null}
+                      <DialogFooter>
+                        <DialogClose render={<Button type="button" variant="outline" disabled={creatingBilibiliJob} />}>
+                          {t.common.cancel}
+                        </DialogClose>
+                        <Button type="submit" disabled={creatingBilibiliJob}>
+                          {creatingBilibiliJob ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
+                          {creatingBilibiliJob ? t.task.creatingBilibiliJob : t.task.startBilibiliUpload}
+                        </Button>
+                      </DialogFooter>
+                    </form>
+                  </DialogContent>
+                </Dialog>
+              </div>
+              {bilibiliJob ? (
+                <div
+                  className={`rounded-lg border px-3 py-2 text-sm ${
+                    bilibiliJob.status === "failed"
+                      ? "border-red-200 bg-red-50 text-red-700"
+                      : bilibiliJob.status === "succeeded"
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                        : "border-sky-200 bg-sky-50 text-sky-900"
+                  }`}
+                >
+                  {bilibiliJob.status === "queued"
+                    ? t.task.bilibiliUploadQueued
+                    : bilibiliJob.status === "running"
+                      ? t.task.bilibiliUploadRunning
+                      : bilibiliJob.status === "succeeded"
+                        ? t.task.bilibiliUploadSucceeded
+                        : `${t.task.bilibiliUploadFailed}${bilibiliJob.error_message ? `：${bilibiliJob.error_message}` : ""}`}
+                </div>
+              ) : null}
             </CardContent>
           </Card>
         ) : null}
@@ -310,9 +486,17 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
             {isManual && canRedoStage ? (
               <p className="mb-3 text-sm text-muted-foreground">{t.task.redoStageHelp}</p>
             ) : null}
+            {canTrim && task?.stages.some((s) => s.name === "trim_video") ? (
+              <p className="mb-3 text-sm text-muted-foreground">{t.task.trimStageHelp}</p>
+            ) : null}
             {redoError ? (
               <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
                 {redoError}
+              </div>
+            ) : null}
+            {trimError ? (
+              <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {trimError}
               </div>
             ) : null}
             {task ? (
@@ -351,6 +535,22 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                                 <RotateCw className="size-3" />
                               )}
                               {redoingStage === stage.name ? t.task.redoingStage : t.task.redoStage}
+                            </Button>
+                          ) : null}
+                          {canTrim && stage.name === "trim_video" ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="ml-auto h-7 px-2 text-xs"
+                              disabled={trimming}
+                              onClick={handleTrim}
+                            >
+                              {trimming ? (
+                                <Loader2 className="size-3 animate-spin" />
+                              ) : (
+                                <RotateCw className="size-3" />
+                              )}
+                              {trimming ? t.task.trimmingStage : t.task.trimStage}
                             </Button>
                           ) : null}
                         </div>

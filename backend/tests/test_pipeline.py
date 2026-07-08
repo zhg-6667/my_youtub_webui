@@ -44,7 +44,7 @@ def test_pipeline_marks_all_stages_succeeded(monkeypatch, tmp_path):
     final_path = tmp_path / "video_final.mp4"
     final_path.write_bytes(b"mp4")
 
-    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio"):
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
         monkeypatch.setattr(PipelineRunner, name, _noop_stage)
 
     def merge_video(self, task):
@@ -57,8 +57,8 @@ def test_pipeline_marks_all_stages_succeeded(monkeypatch, tmp_path):
 
     assert task["status"] == "succeeded"
     assert task["final_video_path"] == str(final_path)
-    assert [stage["status"] for stage in task["stages"]] == ["succeeded"] * 9
-    assert [stage["progress"] for stage in task["stages"]] == [100] * 9
+    assert [stage["status"] for stage in task["stages"]] == ["succeeded"] * 10
+    assert [stage["progress"] for stage in task["stages"]] == [100] * 10
 
 
 def test_pipeline_skips_already_succeeded_stages(monkeypatch, tmp_path):
@@ -217,7 +217,7 @@ def test_pipeline_manual_pauses_after_each_stage(monkeypatch, tmp_path):
 
         return handler
 
-    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_merge_video"):
+    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_merge_video", "_trim_video"):
         monkeypatch.setattr(PipelineRunner, name, fail_later(name))
 
     PipelineRunner(task_id).run()
@@ -264,7 +264,7 @@ def test_pipeline_manual_switch_to_auto_runs_remaining_stages(monkeypatch, tmp_p
 
     monkeypatch.setattr(PipelineRunner, "_download", download)
 
-    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio"):
+    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
         monkeypatch.setattr(PipelineRunner, name, _noop_stage)
 
     def merge_video(self, task):

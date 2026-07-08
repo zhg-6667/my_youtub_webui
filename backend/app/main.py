@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import database, worker
+from . import bilibili_uploads, database, worker
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
 from .adapters.openai_translate import list_models as list_openai_models
@@ -45,6 +45,12 @@ class TaskCreate(BaseModel):
 
 class ContinueTaskRequest(BaseModel):
     execution_mode: str | None = None
+
+
+class BilibiliUploadRequest(BaseModel):
+    title: str
+    publish_mode: str = "now"
+    dtime: str | None = None
 
 
 class YouTubeCookieUpdate(BaseModel):
@@ -100,7 +106,9 @@ async def lifespan(app: FastAPI):
     database.init_db()
     database.backfill_titles_from_metadata()
     database.fail_stale_active_tasks()
+    database.fail_stale_running_bilibili_upload_jobs()
     worker.start(run_task)
+    bilibili_uploads.start()
     yield
 
 
@@ -371,6 +379,113 @@ def redo_stage(task_id: str, stage_name: str) -> dict:
     database.reset_stages_from(task_id, stage_name)
     worker.enqueue(task_id)
     return database.get_task(task_id)
+
+
+class TrimVideoRequest(BaseModel):
+    cut_intervals: list[dict] | None = None
+
+
+@app.post("/api/tasks/{task_id}/trim")
+def trim_video_task(task_id: str, payload: TrimVideoRequest | None = None) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task["status"] in {"running", "queued"}:
+        raise HTTPException(status_code=409, detail="Task is already running or queued.")
+    session_path = task.get("session_path")
+    if not session_path:
+        raise HTTPException(status_code=400, detail="Task has no session path; run the pipeline first.")
+
+    import json as _json
+
+    session = Path(session_path)
+    metadata_dir = session / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    intervals_file = metadata_dir / "cut_intervals.json"
+
+    if payload and payload.cut_intervals:
+        intervals_file.write_text(_json.dumps(payload.cut_intervals, ensure_ascii=False), encoding="utf-8")
+    elif not intervals_file.exists():
+        raise HTTPException(status_code=400, detail="No cut intervals provided and cut_intervals.json not found.")
+
+    trimmed = session / "media" / "video_final_trimmed.mp4"
+    if trimmed.exists():
+        trimmed.unlink()
+
+    _ensure_runtime_ready()
+    database.reset_stages_from(task_id, "trim_video")
+    database.queue_task_for_continue(task_id)
+    worker.enqueue(task_id)
+    return database.get_task(task_id)
+
+
+def _normalize_bilibili_publish_mode(value: str) -> str:
+    mode = value.strip().lower()
+    if mode not in {"now", "scheduled"}:
+        raise HTTPException(status_code=422, detail="publish_mode must be one of: now, scheduled")
+    return mode
+
+
+@app.post("/api/tasks/{task_id}/bilibili-upload", status_code=202)
+def create_bilibili_upload(task_id: str, payload: BilibiliUploadRequest) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task["status"] != "succeeded":
+        raise HTTPException(status_code=409, detail="Only succeeded tasks can be published to Bilibili.")
+    session_path = task.get("session_path")
+    if not session_path:
+        raise HTTPException(status_code=400, detail="Task has no session path; run the pipeline first.")
+    final_path = task.get("final_video_path")
+    if not final_path or not Path(final_path).exists():
+        raise HTTPException(status_code=404, detail="Final video is not available.")
+
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Bilibili title is required.")
+    publish_mode = _normalize_bilibili_publish_mode(payload.publish_mode)
+    dtime = payload.dtime.strip() if payload.dtime else None
+    if publish_mode == "scheduled":
+        if not dtime:
+            raise HTTPException(status_code=422, detail="Scheduled publish time is required.")
+        from scripts.upload_bilibili import UploadBilibiliError, parse_dtime
+
+        try:
+            parse_dtime(dtime)
+        except UploadBilibiliError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    else:
+        dtime = None
+
+    active = database.get_active_bilibili_upload_job(task_id)
+    if active:
+        raise HTTPException(status_code=409, detail="This task already has a Bilibili upload in progress.")
+
+    job_id = database.create_bilibili_upload_job(
+        task_id,
+        title=title,
+        publish_mode=publish_mode,
+        dtime=dtime,
+    )
+    bilibili_uploads.enqueue(job_id)
+    return database.get_bilibili_upload_job(job_id)
+
+
+@app.get("/api/bilibili-upload-jobs/{job_id}")
+def get_bilibili_upload_job(job_id: str) -> dict:
+    job = database.get_bilibili_upload_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bilibili upload job not found.")
+    return job
+
+
+@app.get("/api/bilibili-upload-jobs/{job_id}/log", response_class=PlainTextResponse)
+def get_bilibili_upload_log(job_id: str) -> str:
+    job = database.get_bilibili_upload_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bilibili upload job not found.")
+    path = Path(job["log_path"] or database.bilibili_upload_log_path(job_id))
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 @app.post("/api/tasks/{task_id}/continue")

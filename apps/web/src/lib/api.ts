@@ -11,6 +11,8 @@ export const API_BASE = configuredApiBase()
 export type StageStatus = "pending" | "running" | "succeeded" | "failed"
 export type TaskStatus = "queued" | "running" | "paused" | "succeeded" | "failed"
 export type ExecutionMode = "auto" | "manual"
+export type BilibiliPublishMode = "now" | "scheduled"
+export type BilibiliUploadStatus = "queued" | "running" | "succeeded" | "failed"
 
 export type TaskStage = {
   task_id: string
@@ -38,6 +40,21 @@ export type Task = {
   completed_at: string | null
   execution_mode: ExecutionMode
   stages: TaskStage[]
+}
+
+export type BilibiliUploadJob = {
+  id: string
+  task_id: string
+  title: string
+  publish_mode: BilibiliPublishMode
+  dtime: string | null
+  status: BilibiliUploadStatus
+  log_path: string | null
+  error_message: string | null
+  return_code: number | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
 }
 
 export type CookieInfo = {
@@ -221,6 +238,35 @@ export function saveYtdlpSettings(settings: YtdlpSettings) {
     method: "POST",
     body: JSON.stringify(settings),
   })
+}
+
+export function trimVideo(taskId: string, cutIntervals?: { start: number; end: number }[]) {
+  return request<Task>(`/api/tasks/${taskId}/trim`, {
+    method: "POST",
+    body: JSON.stringify(cutIntervals?.length ? { cut_intervals: cutIntervals } : {}),
+  })
+}
+
+export function createBilibiliUploadJob(
+  taskId: string,
+  payload: { title: string; publish_mode: BilibiliPublishMode; dtime?: string | null },
+) {
+  return request<BilibiliUploadJob>(`/api/tasks/${taskId}/bilibili-upload`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getBilibiliUploadJob(jobId: string) {
+  return request<BilibiliUploadJob>(`/api/bilibili-upload-jobs/${jobId}`)
+}
+
+export async function getBilibiliUploadJobLog(jobId: string): Promise<string> {
+  const response = await fetch(`${API_BASE}/api/bilibili-upload-jobs/${jobId}/log`, { cache: "no-store" })
+  if (!response.ok) {
+    throw new Error(`Failed to load Bilibili upload log: ${response.status}`)
+  }
+  return response.text()
 }
 
 export function finalVideoUrl(taskId: string) {
