@@ -21,14 +21,18 @@ import {
   ExecutionMode,
   StageStatus,
   Task,
+  WatermarkMaskJob,
+  WatermarkMaskMode,
   continueTask,
   createBilibiliUploadJob,
+  createWatermarkMaskJob,
   deleteTask,
   finalVideoDownloadUrl,
   finalVideoUrl,
   getBilibiliUploadJob,
   getTask,
   getTaskLog,
+  getWatermarkMaskJob,
   redoStage,
   rerunTask,
   resumeTask,
@@ -127,6 +131,10 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [creatingBilibiliJob, setCreatingBilibiliJob] = useState(false)
   const [bilibiliJob, setBilibiliJob] = useState<BilibiliUploadJob | null>(null)
   const [bilibiliError, setBilibiliError] = useState("")
+  const [watermarkMode, setWatermarkMode] = useState<WatermarkMaskMode>("patch")
+  const [creatingWatermarkJob, setCreatingWatermarkJob] = useState(false)
+  const [watermarkJob, setWatermarkJob] = useState<WatermarkMaskJob | null>(null)
+  const [watermarkError, setWatermarkError] = useState("")
 
   const handleDelete = async () => {
     setDeleting(true)
@@ -243,11 +251,25 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     }
   }
 
+  const handleCreateWatermarkMask = async () => {
+    setWatermarkError("")
+    setCreatingWatermarkJob(true)
+    try {
+      const job = await createWatermarkMaskJob(id, { mode: watermarkMode })
+      setWatermarkJob(job)
+    } catch (err) {
+      setWatermarkError(err instanceof Error ? err.message : t.task.watermarkMaskError)
+    } finally {
+      setCreatingWatermarkJob(false)
+    }
+  }
+
   const isRunning = task?.status === "running"
   const isQueued = task?.status === "queued"
   const isFailed = task?.status === "failed"
   const isPaused = task?.status === "paused"
   const isManual = task?.execution_mode === "manual"
+  const isBilibiliTask = task?.source_name === "bilibili"
   const canRedoStage = isManual && !isRunning && !isQueued
   const canTrim = !isRunning && !isQueued
   const redoConfirmStageInfo = task?.stages.find((stage) => stage.name === redoConfirmStage)
@@ -291,6 +313,29 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
       window.clearInterval(interval)
     }
   }, [bilibiliJob, t.task.bilibiliUploadError])
+
+  useEffect(() => {
+    if (!watermarkJob || !["queued", "running"].includes(watermarkJob.status)) return
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const next = await getWatermarkMaskJob(watermarkJob.id)
+        if (cancelled) return
+        setWatermarkJob(next)
+        if (next.status === "succeeded") {
+          const updatedTask = await getTask(id)
+          if (!cancelled) setTask(updatedTask)
+        }
+      } catch (err) {
+        if (!cancelled) setWatermarkError(err instanceof Error ? err.message : t.task.watermarkMaskError)
+      }
+    }
+    const interval = window.setInterval(refresh, 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [id, watermarkJob, t.task.watermarkMaskError])
 
   const progress = useMemo(() => {
     if (!task?.stages?.length) return 0
@@ -454,6 +499,35 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                     </form>
                   </DialogContent>
                 </Dialog>
+                {isBilibiliTask ? (
+                  <div className="flex flex-wrap items-center gap-2 rounded-lg border border-sky-100 bg-sky-50 px-2 py-2">
+                    <Select
+                      value={watermarkMode}
+                      onValueChange={(value) => setWatermarkMode(value as WatermarkMaskMode)}
+                      disabled={creatingWatermarkJob || watermarkJob?.status === "queued" || watermarkJob?.status === "running"}
+                    >
+                      <SelectTrigger className="h-9 min-w-40 bg-background">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="patch">{t.task.watermarkMaskPatch}</SelectItem>
+                        <SelectItem value="blur">{t.task.watermarkMaskBlur}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      variant="outline"
+                      onClick={handleCreateWatermarkMask}
+                      disabled={creatingWatermarkJob || watermarkJob?.status === "queued" || watermarkJob?.status === "running"}
+                    >
+                      {creatingWatermarkJob || watermarkJob?.status === "queued" || watermarkJob?.status === "running" ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <RotateCw className="size-4" />
+                      )}
+                      {creatingWatermarkJob ? t.task.creatingWatermarkMask : t.task.maskWatermark}
+                    </Button>
+                  </div>
+                ) : null}
               </div>
               {bilibiliJob ? (
                 <div
@@ -474,6 +548,31 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                         : `${t.task.bilibiliUploadFailed}${bilibiliJob.error_message ? `：${bilibiliJob.error_message}` : ""}`}
                 </div>
               ) : null}
+              {watermarkError ? (
+                <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                  {watermarkError}
+                </div>
+              ) : null}
+              {watermarkJob ? (
+                <div
+                  className={`rounded-lg border px-3 py-2 text-sm ${
+                    watermarkJob.status === "failed"
+                      ? "border-red-200 bg-red-50 text-red-700"
+                      : watermarkJob.status === "succeeded"
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                        : "border-sky-200 bg-sky-50 text-sky-900"
+                  }`}
+                >
+                  {watermarkJob.status === "queued"
+                    ? t.task.watermarkMaskQueued
+                    : watermarkJob.status === "running"
+                      ? t.task.watermarkMaskRunning
+                      : watermarkJob.status === "succeeded"
+                        ? t.task.watermarkMaskSucceeded
+                        : `${t.task.watermarkMaskFailed}${watermarkJob.error_message ? `：${watermarkJob.error_message}` : ""}`}
+                </div>
+              ) : null}
+              {isBilibiliTask ? <p className="text-xs text-muted-foreground">{t.task.watermarkMaskHelp}</p> : null}
             </CardContent>
           </Card>
         ) : null}

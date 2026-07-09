@@ -80,6 +80,23 @@ def init_db() -> None:
               completed_at TEXT,
               FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS watermark_mask_jobs (
+              id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              status TEXT NOT NULL,
+              input_video_path TEXT,
+              output_video_path TEXT,
+              region_json TEXT,
+              log_path TEXT,
+              error_message TEXT,
+              return_code INTEGER,
+              created_at TEXT NOT NULL,
+              started_at TEXT,
+              completed_at TEXT,
+              FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
             """
         )
         defaults = openai_defaults()
@@ -260,6 +277,7 @@ def delete_task(task_id: str) -> bool:
         cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         conn.execute("DELETE FROM task_stages WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM bilibili_upload_jobs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM watermark_mask_jobs WHERE task_id = ?", (task_id,))
         return cursor.rowcount > 0
 
 
@@ -492,3 +510,82 @@ def update_bilibili_upload_job(job_id: str, **fields: Any) -> None:
     values = list(fields.values()) + [job_id]
     with connect() as conn:
         conn.execute(f"UPDATE bilibili_upload_jobs SET {assignments} WHERE id = ?", values)
+
+
+WATERMARK_MASK_ACTIVE_STATUSES = ("queued", "running")
+
+
+def watermark_mask_log_path(job_id: str) -> Path:
+    from .config import LOG_DIR
+
+    return LOG_DIR / f"watermark-mask-{job_id}.log"
+
+
+def create_watermark_mask_job(
+    task_id: str,
+    *,
+    mode: str,
+    input_video_path: str,
+    output_video_path: str,
+    job_id: str | None = None,
+) -> str:
+    new_id = job_id or str(uuid.uuid4())
+    log = watermark_mask_log_path(new_id)
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO watermark_mask_jobs (
+              id, task_id, mode, status, input_video_path, output_video_path, log_path, created_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (new_id, task_id, mode, input_video_path, output_video_path, str(log), now_iso()),
+        )
+    return new_id
+
+
+def get_watermark_mask_job(job_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM watermark_mask_jobs WHERE id = ?", (job_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_active_watermark_mask_job(task_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT * FROM watermark_mask_jobs
+            WHERE task_id = ? AND status IN ({','.join('?' for _ in WATERMARK_MASK_ACTIVE_STATUSES)})
+            ORDER BY created_at DESC, rowid DESC LIMIT 1
+            """,
+            (task_id, *WATERMARK_MASK_ACTIVE_STATUSES),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_queued_watermark_mask_jobs() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM watermark_mask_jobs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def fail_stale_running_watermark_mask_jobs() -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE watermark_mask_jobs
+            SET status = 'failed', error_message = ?, completed_at = ?
+            WHERE status = 'running'
+            """,
+            ("Backend restarted before the watermark mask completed.", now_iso()),
+        )
+
+
+def update_watermark_mask_job(job_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    values = list(fields.values()) + [job_id]
+    with connect() as conn:
+        conn.execute(f"UPDATE watermark_mask_jobs SET {assignments} WHERE id = ?", values)

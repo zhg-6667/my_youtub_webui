@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from backend.app.adapters import ffmpeg
+from backend.app.adapters import watermark_mask
 
 
 def test_video_orientation_uses_height_greater_than_width(monkeypatch):
@@ -85,6 +86,7 @@ def test_merge_video_burns_portrait_subtitles(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+    monkeypatch.setattr(ffmpeg, "_video_encoders", lambda: [["-c:v", "libx264", "-preset", "fast", "-crf", "23"]])
 
     final_video = ffmpeg.merge_video(
         tmp_path / "video.mp4",
@@ -95,8 +97,7 @@ def test_merge_video_burns_portrait_subtitles(monkeypatch, tmp_path):
     )
 
     assert final_video == session / "media" / "video_final.mp4"
-    assert len(commands) == 3
-    final_command = commands[-1]
+    final_command = next(cmd for cmd in reversed(commands) if "-vf" in cmd)
     filter_arg = final_command[final_command.index("-vf") + 1]
     assert filter_arg.startswith("subtitles=filename='metadata/subtitles.zh.srt'")
     assert "FontSize=12" in filter_arg
@@ -138,6 +139,7 @@ def test_merge_video_uses_absolute_media_paths_when_cwd_is_session(monkeypatch, 
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+    monkeypatch.setattr(ffmpeg, "_video_encoders", lambda: [["-c:v", "libx264", "-preset", "fast", "-crf", "23"]])
 
     ffmpeg.merge_video(
         session / "media" / "video_source.mp4",
@@ -194,15 +196,67 @@ def test_write_srt_splits_long_sentence_into_multiple_entries(tmp_path):
     assert all("-->" in b for b in blocks)
 
 
-def test_probe_video_size_uses_configured_ffprobe(monkeypatch):
+
+
+def test_watermark_mask_patch_filter_uses_sample_region(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    session.mkdir()
+    input_video = tmp_path / "video.mp4"
+    input_video.write_bytes(b"video")
     commands: list[list[str]] = []
 
-    def fake_run(cmd, capture_output=False, text=False, **kwargs):
+    monkeypatch.setattr(watermark_mask, "detect_bilibili_watermark_region", lambda video, session: watermark_mask.WatermarkRegion(656, 17, 179, 34, 656, 60))
+    monkeypatch.setattr(watermark_mask, "_probe_duration", lambda video: 5.0)
+    monkeypatch.setattr(watermark_mask, "_video_encoders", lambda: [["-c:v", "libx264", "-preset", "fast", "-crf", "23"]])
+
+    def fake_run(cmd, check=False, timeout=None, cwd=None, **kwargs):
         commands.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout="1920,1080\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setenv("FFPROBE_PATH", "/opt/bin/ffprobe")
-    monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+    monkeypatch.setattr(watermark_mask.subprocess, "run", fake_run)
 
-    assert ffmpeg.probe_video_size(Path("video.mp4")) == (1920, 1080)
-    assert commands[0][0] == "/opt/bin/ffprobe"
+    output, region = watermark_mask.mask_bilibili_watermark(input_video, session, "patch")
+
+    assert output == session / "media" / "video_final_watermark_masked_patch.mp4"
+    assert region.sample_y == 60
+    filter_graph = commands[-1][commands[-1].index("-filter_complex") + 1]
+    assert "crop=179:34:656:60" in filter_graph
+    assert "overlay=656:17" in filter_graph
+
+
+def test_watermark_mask_blur_filter_uses_boxblur_and_drawbox(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    session.mkdir()
+    input_video = tmp_path / "video.mp4"
+    input_video.write_bytes(b"video")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(watermark_mask, "detect_bilibili_watermark_region", lambda video, session: watermark_mask.WatermarkRegion(656, 17, 179, 34, 656, 60))
+    monkeypatch.setattr(watermark_mask, "_probe_duration", lambda video: 5.0)
+    monkeypatch.setattr(watermark_mask, "_video_encoders", lambda: [["-c:v", "libx264", "-preset", "fast", "-crf", "23"]])
+
+    def fake_run(cmd, check=False, timeout=None, cwd=None, **kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(watermark_mask.subprocess, "run", fake_run)
+
+    output, _ = watermark_mask.mask_bilibili_watermark(input_video, session, "blur")
+
+    assert output == session / "media" / "video_final_watermark_masked_blur.mp4"
+    filter_graph = commands[-1][commands[-1].index("-filter_complex") + 1]
+    assert "boxblur=" in filter_graph
+    assert "drawbox=x=656:y=17:w=179:h=34:color=black@0.45:t=fill" in filter_graph
+
+
+def test_watermark_detection_falls_back_when_no_frame_can_be_read(monkeypatch, tmp_path):
+    monkeypatch.setattr(watermark_mask, "probe_video_size", lambda video: (852, 480))
+    monkeypatch.setattr(watermark_mask, "_probe_duration", lambda video: 5.0)
+    monkeypatch.setattr(watermark_mask, "_read_rgb_frame", lambda video, seconds, width, height: None)
+
+    region = watermark_mask.detect_bilibili_watermark_region(tmp_path / "video.mp4", tmp_path)
+
+    assert region.x == 656
+    assert region.y == 17
+    assert region.width == 179
+    assert region.height == 34

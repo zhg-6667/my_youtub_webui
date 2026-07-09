@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import bilibili_uploads, database, worker
+from . import bilibili_uploads, database, watermark_masks, worker
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
 from .adapters.openai_translate import list_models as list_openai_models
@@ -51,6 +51,10 @@ class BilibiliUploadRequest(BaseModel):
     title: str
     publish_mode: str = "now"
     dtime: str | None = None
+
+
+class WatermarkMaskRequest(BaseModel):
+    mode: str = "patch"
 
 
 class YouTubeCookieUpdate(BaseModel):
@@ -107,8 +111,10 @@ async def lifespan(app: FastAPI):
     database.backfill_titles_from_metadata()
     database.fail_stale_active_tasks()
     database.fail_stale_running_bilibili_upload_jobs()
+    database.fail_stale_running_watermark_mask_jobs()
     worker.start(run_task)
     bilibili_uploads.start()
+    watermark_masks.start()
     yield
 
 
@@ -151,6 +157,17 @@ app.add_middleware(
 )
 
 
+def _task_with_source(task: dict | None) -> dict | None:
+    if not task:
+        return None
+    result = dict(task)
+    try:
+        result["source_name"] = detect_source(result["url"]).name
+    except ValueError:
+        result["source_name"] = "unknown"
+    return result
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -179,7 +196,7 @@ def create_task(payload: TaskCreate) -> dict:
 
     existing_id = database.find_task_by_video_id(video_id)
     if existing_id:
-        return database.get_task(existing_id)
+        return _task_with_source(database.get_task(existing_id))
 
     _ensure_runtime_ready()
     task_id = database.create_task(
@@ -188,7 +205,7 @@ def create_task(payload: TaskCreate) -> dict:
         execution_mode=normalize_execution_mode(payload.execution_mode),
     )
     worker.enqueue(task_id)
-    return database.get_task(task_id)
+    return _task_with_source(database.get_task(task_id))
 
 
 def _clean_upload_filename(filename: str | None) -> str:
@@ -284,17 +301,17 @@ def upload_local_video(
     )
     database.update_task(task_id, title=Path(original_name).stem)
     worker.enqueue(task_id)
-    return database.get_task(task_id)
+    return _task_with_source(database.get_task(task_id))
 
 
 @app.get("/api/tasks/current")
 def current_task() -> dict | None:
-    return database.get_current_task()
+    return _task_with_source(database.get_current_task())
 
 
 @app.get("/api/tasks")
 def list_tasks(limit: int = 100) -> dict:
-    return {"tasks": database.list_tasks(limit=limit)}
+    return {"tasks": [_task_with_source(task) for task in database.list_tasks(limit=limit)]}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -302,7 +319,7 @@ def task_detail(task_id: str) -> dict:
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
-    return task
+    return _task_with_source(task)
 
 
 def _is_inside_workfolder(path: Path) -> bool:
@@ -353,7 +370,7 @@ def rerun_task(task_id: str) -> dict:
     _purge_task(task)
     new_id = database.create_task(url, task_id=task_id, execution_mode=execution_mode)
     worker.enqueue(new_id)
-    return database.get_task(new_id)
+    return _task_with_source(database.get_task(new_id))
 
 
 @app.post("/api/tasks/{task_id}/stages/{stage_name}/redo")
@@ -378,7 +395,7 @@ def redo_stage(task_id: str, stage_name: str) -> dict:
         remove_stage_artifacts(Path(session_path), stage_name, detect_source(task["url"]))
     database.reset_stages_from(task_id, stage_name)
     worker.enqueue(task_id)
-    return database.get_task(task_id)
+    return _task_with_source(database.get_task(task_id))
 
 
 class TrimVideoRequest(BaseModel):
@@ -416,13 +433,20 @@ def trim_video_task(task_id: str, payload: TrimVideoRequest | None = None) -> di
     database.reset_stages_from(task_id, "trim_video")
     database.queue_task_for_continue(task_id)
     worker.enqueue(task_id)
-    return database.get_task(task_id)
+    return _task_with_source(database.get_task(task_id))
 
 
 def _normalize_bilibili_publish_mode(value: str) -> str:
     mode = value.strip().lower()
     if mode not in {"now", "scheduled"}:
         raise HTTPException(status_code=422, detail="publish_mode must be one of: now, scheduled")
+    return mode
+
+
+def _normalize_watermark_mask_mode(value: str) -> str:
+    mode = value.strip().lower()
+    if mode not in {"patch", "blur"}:
+        raise HTTPException(status_code=422, detail="mode must be one of: patch, blur")
     return mode
 
 
@@ -488,6 +512,61 @@ def get_bilibili_upload_log(job_id: str) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
+@app.post("/api/tasks/{task_id}/watermark-mask", status_code=202)
+def create_watermark_mask(task_id: str, payload: WatermarkMaskRequest) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    try:
+        source_name = detect_source(task["url"]).name
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="Only Bilibili tasks support watermark masking.") from exc
+    if source_name != "bilibili":
+        raise HTTPException(status_code=409, detail="Only Bilibili tasks support watermark masking.")
+    if task["status"] in {"running", "queued"}:
+        raise HTTPException(status_code=409, detail="Task is already running or queued.")
+    if task["status"] != "succeeded":
+        raise HTTPException(status_code=409, detail="Only succeeded tasks can be masked.")
+    session_path = task.get("session_path")
+    if not session_path:
+        raise HTTPException(status_code=400, detail="Task has no session path; run the pipeline first.")
+    final_path = task.get("final_video_path")
+    if not final_path or not Path(final_path).exists():
+        raise HTTPException(status_code=404, detail="Final video is not available.")
+
+    mode = _normalize_watermark_mask_mode(payload.mode)
+    active = database.get_active_watermark_mask_job(task_id)
+    if active:
+        raise HTTPException(status_code=409, detail="This task already has a watermark mask in progress.")
+
+    output_path = Path(session_path) / "media" / f"video_final_watermark_masked_{mode}.mp4"
+    job_id = database.create_watermark_mask_job(
+        task_id,
+        mode=mode,
+        input_video_path=final_path,
+        output_video_path=str(output_path),
+    )
+    watermark_masks.enqueue(job_id)
+    return database.get_watermark_mask_job(job_id)
+
+
+@app.get("/api/watermark-mask-jobs/{job_id}")
+def get_watermark_mask_job(job_id: str) -> dict:
+    job = database.get_watermark_mask_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Watermark mask job not found.")
+    return job
+
+
+@app.get("/api/watermark-mask-jobs/{job_id}/log", response_class=PlainTextResponse)
+def get_watermark_mask_log(job_id: str) -> str:
+    job = database.get_watermark_mask_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Watermark mask job not found.")
+    path = Path(job["log_path"] or database.watermark_mask_log_path(job_id))
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
 @app.post("/api/tasks/{task_id}/continue")
 def continue_task(task_id: str, payload: ContinueTaskRequest | None = None) -> dict:
     task = database.get_task(task_id)
@@ -502,7 +581,7 @@ def continue_task(task_id: str, payload: ContinueTaskRequest | None = None) -> d
     _ensure_runtime_ready()
     database.queue_task_for_continue(task_id)
     worker.enqueue(task_id)
-    return database.get_task(task_id)
+    return _task_with_source(database.get_task(task_id))
 
 
 @app.post("/api/tasks/{task_id}/resume")
@@ -515,7 +594,7 @@ def resume_task(task_id: str) -> dict:
     _ensure_runtime_ready()
     database.reset_failed_for_resume(task_id)
     worker.enqueue(task_id)
-    return database.get_task(task_id)
+    return _task_with_source(database.get_task(task_id))
 
 
 @app.get("/api/tasks/{task_id}/log", response_class=PlainTextResponse)

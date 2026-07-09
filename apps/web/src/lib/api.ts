@@ -13,6 +13,8 @@ export type TaskStatus = "queued" | "running" | "paused" | "succeeded" | "failed
 export type ExecutionMode = "auto" | "manual"
 export type BilibiliPublishMode = "now" | "scheduled"
 export type BilibiliUploadStatus = "queued" | "running" | "succeeded" | "failed"
+export type WatermarkMaskMode = "patch" | "blur"
+export type WatermarkMaskStatus = "queued" | "running" | "succeeded" | "failed"
 
 export type TaskStage = {
   task_id: string
@@ -39,6 +41,7 @@ export type Task = {
   started_at: string | null
   completed_at: string | null
   execution_mode: ExecutionMode
+  source_name?: string
   stages: TaskStage[]
 }
 
@@ -49,6 +52,22 @@ export type BilibiliUploadJob = {
   publish_mode: BilibiliPublishMode
   dtime: string | null
   status: BilibiliUploadStatus
+  log_path: string | null
+  error_message: string | null
+  return_code: number | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+}
+
+export type WatermarkMaskJob = {
+  id: string
+  task_id: string
+  mode: WatermarkMaskMode
+  status: WatermarkMaskStatus
+  input_video_path: string | null
+  output_video_path: string | null
+  region_json: string | null
   log_path: string | null
   error_message: string | null
   return_code: number | null
@@ -113,6 +132,7 @@ export type TaskSummary = {
   started_at: string | null
   completed_at: string | null
   execution_mode?: ExecutionMode
+  source_name?: string
 }
 
 export function getCurrentTask() {
@@ -265,6 +285,25 @@ export async function getBilibiliUploadJobLog(jobId: string): Promise<string> {
   const response = await fetch(`${API_BASE}/api/bilibili-upload-jobs/${jobId}/log`, { cache: "no-store" })
   if (!response.ok) {
     throw new Error(`Failed to load Bilibili upload log: ${response.status}`)
+  }
+  return response.text()
+}
+
+export function createWatermarkMaskJob(taskId: string, payload: { mode: WatermarkMaskMode }) {
+  return request<WatermarkMaskJob>(`/api/tasks/${taskId}/watermark-mask`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getWatermarkMaskJob(jobId: string) {
+  return request<WatermarkMaskJob>(`/api/watermark-mask-jobs/${jobId}`)
+}
+
+export async function getWatermarkMaskJobLog(jobId: string): Promise<string> {
+  const response = await fetch(`${API_BASE}/api/watermark-mask-jobs/${jobId}/log`, { cache: "no-store" })
+  if (!response.ok) {
+    throw new Error(`Failed to load watermark mask log: ${response.status}`)
   }
   return response.text()
 }
