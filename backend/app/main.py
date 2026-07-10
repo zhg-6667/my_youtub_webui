@@ -78,6 +78,60 @@ class YtdlpSettingsUpdate(BaseModel):
     proxy_port: str = ""
 
 
+class MailSettingsUpdate(BaseModel):
+    enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: str = "587"
+    smtp_username: str = ""
+    smtp_password: str = ""
+    clear_smtp_password: bool = False
+    from_address: str = ""
+    to_addresses: str = ""
+    smtp_security: str = "tls"
+    notify_on_success: bool = True
+    notify_on_failure: bool = True
+
+
+def bool_setting(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def setting_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def normalize_smtp_port(value: str) -> str:
+    smtp_port = value.strip() or "587"
+    if not smtp_port.isdigit():
+        raise HTTPException(status_code=422, detail="SMTP port must be numeric.")
+    port = int(smtp_port)
+    if port < 1 or port > 65535:
+        raise HTTPException(status_code=422, detail="SMTP port must be between 1 and 65535.")
+    return str(port)
+
+
+def normalize_smtp_security(value: str) -> str:
+    security = value.strip().lower() or "tls"
+    if security not in {"none", "tls", "ssl"}:
+        raise HTTPException(status_code=422, detail="SMTP security must be one of: none, tls, ssl.")
+    return security
+
+
+def normalize_mail_addresses(value: str) -> str:
+    addresses = [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
+    for address in addresses:
+        if "@" not in address or address.startswith("@") or address.endswith("@"):
+            raise HTTPException(status_code=422, detail=f"Invalid email address: {address}")
+    return ",".join(addresses)
+
+
+def normalize_mail_sender(value: str) -> str:
+    sender = value.strip()
+    if sender and ("@" not in sender or sender.startswith("@") or sender.endswith("@")):
+        raise HTTPException(status_code=422, detail="Invalid from address.")
+    return sender
+
+
 def normalize_proxy_port(value: str) -> str:
     proxy_port = value.strip()
     if not proxy_port:
@@ -687,3 +741,39 @@ def get_ytdlp_settings() -> dict:
 def save_ytdlp_settings(payload: YtdlpSettingsUpdate) -> dict:
     database.save_ytdlp_settings(normalize_proxy_port(payload.proxy_port))
     return get_ytdlp_settings()
+
+
+@app.get("/api/settings/mail")
+def get_mail_settings() -> dict:
+    settings = database.get_mail_settings()
+    return {
+        "enabled": bool_setting(settings["enabled"]),
+        "smtp_host": settings["smtp_host"],
+        "smtp_port": settings["smtp_port"],
+        "smtp_username": settings["smtp_username"],
+        "smtp_password": mask_secret(settings["smtp_password"]),
+        "has_smtp_password": bool(settings["smtp_password"]),
+        "from_address": settings["from_address"],
+        "to_addresses": settings["to_addresses"],
+        "smtp_security": settings["smtp_security"],
+        "notify_on_success": bool_setting(settings["notify_on_success"]),
+        "notify_on_failure": bool_setting(settings["notify_on_failure"]),
+    }
+
+
+@app.post("/api/settings/mail")
+def save_mail_settings(payload: MailSettingsUpdate) -> dict:
+    database.save_mail_settings(
+        enabled=setting_bool(payload.enabled),
+        smtp_host=payload.smtp_host,
+        smtp_port=normalize_smtp_port(payload.smtp_port),
+        smtp_username=payload.smtp_username,
+        smtp_password=payload.smtp_password,
+        from_address=normalize_mail_sender(payload.from_address),
+        to_addresses=normalize_mail_addresses(payload.to_addresses),
+        smtp_security=normalize_smtp_security(payload.smtp_security),
+        notify_on_success=setting_bool(payload.notify_on_success),
+        notify_on_failure=setting_bool(payload.notify_on_failure),
+        clear_smtp_password=payload.clear_smtp_password,
+    )
+    return get_mail_settings()

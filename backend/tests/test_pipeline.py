@@ -175,6 +175,76 @@ def test_pipeline_failure_stops_following_stages(monkeypatch, tmp_path):
     assert task["error_message"] == "asr exploded"
 
 
+def test_pipeline_sends_success_notification(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=successmail", task_id="successmail")
+    final_path = tmp_path / "video_final.mp4"
+    final_path.write_bytes(b"mp4")
+
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
+        monkeypatch.setattr(PipelineRunner, name, _noop_stage)
+
+    def merge_video(self, task):
+        self.artifacts.final_video = final_path
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+    monkeypatch.setattr(
+        "backend.app.notifications.send_task_notification",
+        lambda task, event: sent.append((task["id"], event)) or "sent",
+    )
+
+    PipelineRunner(task_id).run()
+
+    assert sent == [(task_id, "succeeded")]
+
+
+def test_pipeline_notification_error_does_not_change_task_status(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=mailerrtask", task_id="mailerrtask")
+    final_path = tmp_path / "video_final.mp4"
+    final_path.write_bytes(b"mp4")
+
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
+        monkeypatch.setattr(PipelineRunner, name, _noop_stage)
+
+    def merge_video(self, task):
+        self.artifacts.final_video = final_path
+
+    def fail_notification(task, event):
+        raise RuntimeError("smtp down")
+
+    monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+    monkeypatch.setattr("backend.app.notifications.send_task_notification", fail_notification)
+
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    log_content = database.log_path(task_id).read_text(encoding="utf-8")
+
+    assert task["status"] == "succeeded"
+    assert "Mail notification failed: smtp down" in log_content
+
+
+def test_pipeline_sends_failure_notification(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=failedmailx", task_id="failedmailx")
+    monkeypatch.setattr(PipelineRunner, "_download", _noop_stage)
+
+    def fail_separate(self, task):
+        raise RuntimeError("separate exploded")
+
+    sent: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(PipelineRunner, "_separate", fail_separate)
+    monkeypatch.setattr(
+        "backend.app.notifications.send_task_notification",
+        lambda task, event: sent.append((task["id"], event, task["error_message"])) or "sent",
+    )
+
+    PipelineRunner(task_id).run()
+
+    assert sent == [(task_id, "failed", "separate exploded")]
+
+
 def test_stage_progress_is_throttled(monkeypatch, tmp_path):
     configure_db(monkeypatch, tmp_path)
     task_id = database.create_task("https://www.youtube.com/watch?v=progressidx")

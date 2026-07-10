@@ -99,6 +99,20 @@ export type YtdlpSettings = {
   proxy_port: string
 }
 
+export type MailSettings = {
+  enabled: boolean
+  smtp_host: string
+  smtp_port: string
+  smtp_username: string
+  smtp_password: string
+  has_smtp_password: boolean
+  from_address: string
+  to_addresses: string
+  smtp_security: "none" | "tls" | "ssl"
+  notify_on_success: boolean
+  notify_on_failure: boolean
+}
+
 export type LocalDirection = "en-zh" | "zh-en"
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -255,6 +269,21 @@ export function getYtdlpSettings() {
 
 export function saveYtdlpSettings(settings: YtdlpSettings) {
   return request<YtdlpSettings>("/api/settings/ytdlp", {
+    method: "POST",
+    body: JSON.stringify(settings),
+  })
+}
+
+export function getMailSettings() {
+  return request<MailSettings>("/api/settings/mail")
+}
+
+type MailSettingsSave = Omit<MailSettings, "has_smtp_password"> & {
+  clear_smtp_password?: boolean
+}
+
+export function saveMailSettings(settings: MailSettingsSave) {
+  return request<MailSettings>("/api/settings/mail", {
     method: "POST",
     body: JSON.stringify(settings),
   })

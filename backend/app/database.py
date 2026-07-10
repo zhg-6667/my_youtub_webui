@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import DB_PATH, ensure_runtime_dirs, openai_defaults, ytdlp_defaults
+from .config import DB_PATH, ensure_runtime_dirs, mail_defaults, openai_defaults, ytdlp_defaults
 from .stages import STAGES
 
 
@@ -109,6 +109,11 @@ def init_db() -> None:
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (f"ytdlp.{key}", value, now_iso()),
+            )
+        for key, value in mail_defaults().items():
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (f"mail.{key}", value, now_iso()),
             )
         task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
         if "title" not in task_columns:
@@ -424,6 +429,52 @@ def get_ytdlp_settings() -> dict[str, str]:
 
 def save_ytdlp_settings(proxy_port: str) -> None:
     set_setting("ytdlp.proxy_port", proxy_port.strip())
+
+
+def get_mail_settings() -> dict[str, str]:
+    defaults = mail_defaults()
+    return {
+        "enabled": get_setting("mail.enabled", defaults["enabled"]),
+        "smtp_host": get_setting("mail.smtp_host", defaults["smtp_host"]),
+        "smtp_port": get_setting("mail.smtp_port", defaults["smtp_port"]),
+        "smtp_username": get_setting("mail.smtp_username", defaults["smtp_username"]),
+        "smtp_password": get_setting("mail.smtp_password", defaults["smtp_password"]),
+        "from_address": get_setting("mail.from_address", defaults["from_address"]),
+        "to_addresses": get_setting("mail.to_addresses", defaults["to_addresses"]),
+        "smtp_security": get_setting("mail.smtp_security", defaults["smtp_security"]),
+        "notify_on_success": get_setting("mail.notify_on_success", defaults["notify_on_success"]),
+        "notify_on_failure": get_setting("mail.notify_on_failure", defaults["notify_on_failure"]),
+    }
+
+
+def save_mail_settings(
+    *,
+    enabled: str,
+    smtp_host: str,
+    smtp_port: str,
+    smtp_username: str,
+    smtp_password: str,
+    from_address: str,
+    to_addresses: str,
+    smtp_security: str,
+    notify_on_success: str,
+    notify_on_failure: str,
+    clear_smtp_password: bool = False,
+) -> None:
+    set_setting("mail.enabled", enabled.strip())
+    set_setting("mail.smtp_host", smtp_host.strip())
+    set_setting("mail.smtp_port", smtp_port.strip())
+    set_setting("mail.smtp_username", smtp_username.strip())
+    cleaned_password = smtp_password.strip()
+    if clear_smtp_password:
+        set_setting("mail.smtp_password", "")
+    elif cleaned_password and set(cleaned_password) != {"*"}:
+        set_setting("mail.smtp_password", cleaned_password)
+    set_setting("mail.from_address", from_address.strip())
+    set_setting("mail.to_addresses", to_addresses.strip())
+    set_setting("mail.smtp_security", smtp_security.strip())
+    set_setting("mail.notify_on_success", notify_on_success.strip())
+    set_setting("mail.notify_on_failure", notify_on_failure.strip())
 
 
 

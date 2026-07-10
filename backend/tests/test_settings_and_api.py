@@ -678,6 +678,147 @@ def test_ytdlp_proxy_port_rejects_invalid_value(monkeypatch, tmp_path):
     assert response.status_code == 422
 
 
+def test_mail_settings_are_masked_and_saved(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    saved = client.post(
+        "/api/settings/mail",
+        json={
+            "enabled": True,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": "465",
+            "smtp_username": "user@example.com",
+            "smtp_password": "secret",
+            "from_address": "noreply@example.com",
+            "to_addresses": "ops@example.com; dev@example.com",
+            "smtp_security": "ssl",
+            "notify_on_success": True,
+            "notify_on_failure": False,
+        },
+    )
+    loaded = client.get("/api/settings/mail")
+
+    assert saved.status_code == 200
+    assert loaded.status_code == 200
+    body = loaded.json()
+    assert body["enabled"] is True
+    assert body["smtp_password"] == "********"
+    assert body["has_smtp_password"] is True
+    assert body["to_addresses"] == "ops@example.com,dev@example.com"
+    assert body["smtp_security"] == "ssl"
+    assert body["notify_on_failure"] is False
+    assert "secret" not in loaded.text
+
+
+def test_masked_mail_password_is_not_saved_back(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    database.save_mail_settings(
+        enabled="true",
+        smtp_host="smtp.example.com",
+        smtp_port="587",
+        smtp_username="user@example.com",
+        smtp_password="secret",
+        from_address="noreply@example.com",
+        to_addresses="ops@example.com",
+        smtp_security="tls",
+        notify_on_success="true",
+        notify_on_failure="true",
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/settings/mail",
+        json={
+            "enabled": True,
+            "smtp_host": "smtp2.example.com",
+            "smtp_port": "587",
+            "smtp_username": "user@example.com",
+            "smtp_password": "********",
+            "clear_smtp_password": False,
+            "from_address": "noreply@example.com",
+            "to_addresses": "ops@example.com",
+            "smtp_security": "tls",
+            "notify_on_success": True,
+            "notify_on_failure": True,
+        },
+    )
+
+    assert response.status_code == 200
+    settings = database.get_mail_settings()
+    assert settings["smtp_password"] == "secret"
+    assert settings["smtp_host"] == "smtp2.example.com"
+
+
+def test_mail_password_can_be_cleared(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    database.save_mail_settings(
+        enabled="true",
+        smtp_host="smtp.example.com",
+        smtp_port="587",
+        smtp_username="user@example.com",
+        smtp_password="secret",
+        from_address="noreply@example.com",
+        to_addresses="ops@example.com",
+        smtp_security="tls",
+        notify_on_success="true",
+        notify_on_failure="true",
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/settings/mail",
+        json={
+            "enabled": True,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": "587",
+            "smtp_username": "user@example.com",
+            "smtp_password": "",
+            "clear_smtp_password": True,
+            "from_address": "noreply@example.com",
+            "to_addresses": "ops@example.com",
+            "smtp_security": "tls",
+            "notify_on_success": True,
+            "notify_on_failure": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["has_smtp_password"] is False
+    assert database.get_mail_settings()["smtp_password"] == ""
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        ({"smtp_port": "70000"}, "SMTP port must be between 1 and 65535."),
+        ({"smtp_security": "starttls"}, "SMTP security must be one of: none, tls, ssl."),
+        ({"to_addresses": "not-an-email"}, "Invalid email address: not-an-email"),
+    ],
+)
+def test_mail_settings_reject_invalid_values(monkeypatch, tmp_path, payload, detail):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+    body = {
+        "enabled": True,
+        "smtp_host": "smtp.example.com",
+        "smtp_port": "587",
+        "smtp_username": "user@example.com",
+        "smtp_password": "secret",
+        "from_address": "noreply@example.com",
+        "to_addresses": "ops@example.com",
+        "smtp_security": "tls",
+        "notify_on_success": True,
+        "notify_on_failure": True,
+    }
+    body.update(payload)
+
+    response = client.post("/api/settings/mail", json=body)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == detail
+
+
 def test_upload_local_video_creates_task_and_saved_file(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     enqueued: list[str] = []

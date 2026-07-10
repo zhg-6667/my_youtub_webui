@@ -5,10 +5,12 @@ import { Eye, EyeOff, RefreshCw, Settings } from "lucide-react"
 
 import {
   getCookieInfo,
+  getMailSettings,
   getOpenAIModels,
   getOpenAISettings,
   getYtdlpSettings,
   saveCookie,
+  saveMailSettings,
   saveOpenAISettings,
   saveYtdlpSettings,
 } from "@/lib/api"
@@ -41,9 +43,20 @@ type SettingsForm = {
   model: string
   translateConcurrency: string
   proxyPort: string
+  mailEnabled: boolean
+  mailSmtpHost: string
+  mailSmtpPort: string
+  mailSmtpUsername: string
+  mailSmtpPassword: string
+  mailFromAddress: string
+  mailToAddresses: string
+  mailSmtpSecurity: "none" | "tls" | "ssl"
+  mailNotifyOnSuccess: boolean
+  mailNotifyOnFailure: boolean
 }
 
 const SAVED_API_KEY_MASK = "********"
+const SAVED_SMTP_PASSWORD_MASK = "********"
 const SAVED_COOKIE_SENTINEL = "__YOUDUB_SAVED_COOKIE__"
 
 type MessageKey = "keySaved" | "saved"
@@ -55,6 +68,16 @@ const defaultSettings: SettingsForm = {
   model: "gpt-4o-mini",
   translateConcurrency: "50",
   proxyPort: "",
+  mailEnabled: false,
+  mailSmtpHost: "",
+  mailSmtpPort: "587",
+  mailSmtpUsername: "",
+  mailSmtpPassword: "",
+  mailFromAddress: "",
+  mailToAddresses: "",
+  mailSmtpSecurity: "tls",
+  mailNotifyOnSuccess: true,
+  mailNotifyOnFailure: true,
 }
 
 function uniqueModels(models: string[]) {
@@ -71,8 +94,10 @@ export function SettingsDialog() {
   const [modelsLoaded, setModelsLoaded] = useState(false)
   const [modelsLoading, setModelsLoading] = useState(false)
   const [showApiKey, setShowApiKey] = useState(false)
+  const [showSmtpPassword, setShowSmtpPassword] = useState(false)
   const [cookieDirty, setCookieDirty] = useState(false)
   const [apiKeyDirty, setApiKeyDirty] = useState(false)
+  const [smtpPasswordDirty, setSmtpPasswordDirty] = useState(false)
 
   const cookieValue =
     settings.cookie === SAVED_COOKIE_SENTINEL ? t.settings.savedCookie : settings.cookie
@@ -81,8 +106,8 @@ export function SettingsDialog() {
 
   useEffect(() => {
     if (!open) return
-    Promise.all([getCookieInfo(), getOpenAISettings(), getYtdlpSettings()])
-      .then(([cookie, openai, ytdlp]) => {
+    Promise.all([getCookieInfo(), getOpenAISettings(), getYtdlpSettings(), getMailSettings()])
+      .then(([cookie, openai, ytdlp, mail]) => {
         setSettings({
           cookie: cookie.exists ? SAVED_COOKIE_SENTINEL : "",
           baseUrl: openai.base_url,
@@ -90,12 +115,24 @@ export function SettingsDialog() {
           model: openai.model,
           translateConcurrency: openai.translate_concurrency || "50",
           proxyPort: ytdlp.proxy_port,
+          mailEnabled: mail.enabled,
+          mailSmtpHost: mail.smtp_host,
+          mailSmtpPort: mail.smtp_port || "587",
+          mailSmtpUsername: mail.smtp_username,
+          mailSmtpPassword: mail.has_smtp_password ? mail.smtp_password || SAVED_SMTP_PASSWORD_MASK : "",
+          mailFromAddress: mail.from_address,
+          mailToAddresses: mail.to_addresses,
+          mailSmtpSecurity: mail.smtp_security,
+          mailNotifyOnSuccess: mail.notify_on_success,
+          mailNotifyOnFailure: mail.notify_on_failure,
         })
         setModelOptions(uniqueModels([openai.model]))
         setModelsLoaded(false)
         setShowApiKey(false)
+        setShowSmtpPassword(false)
         setCookieDirty(false)
         setApiKeyDirty(false)
+        setSmtpPasswordDirty(false)
         setMessage("")
         setMessageKey(openai.has_api_key ? "keySaved" : null)
       })
@@ -120,6 +157,20 @@ export function SettingsDialog() {
         translate_concurrency: settings.translateConcurrency,
       })
       const ytdlp = await saveYtdlpSettings({ proxy_port: settings.proxyPort })
+      const clearSmtpPassword = smtpPasswordDirty && !settings.mailSmtpPassword.trim()
+      const mail = await saveMailSettings({
+        enabled: settings.mailEnabled,
+        smtp_host: settings.mailSmtpHost,
+        smtp_port: settings.mailSmtpPort,
+        smtp_username: settings.mailSmtpUsername,
+        smtp_password: smtpPasswordDirty ? settings.mailSmtpPassword : "",
+        clear_smtp_password: clearSmtpPassword,
+        from_address: settings.mailFromAddress,
+        to_addresses: settings.mailToAddresses,
+        smtp_security: settings.mailSmtpSecurity,
+        notify_on_success: settings.mailNotifyOnSuccess,
+        notify_on_failure: settings.mailNotifyOnFailure,
+      })
       setMessageKey("saved")
       setSettings((current) => ({
         ...current,
@@ -127,9 +178,13 @@ export function SettingsDialog() {
         cookie: cookieDirty ? (cookie?.exists ? SAVED_COOKIE_SENTINEL : "") : current.cookie,
         translateConcurrency: openai.translate_concurrency || current.translateConcurrency,
         proxyPort: ytdlp.proxy_port,
+        mailSmtpPassword: mail.has_smtp_password ? mail.smtp_password || SAVED_SMTP_PASSWORD_MASK : "",
+        mailSmtpPort: mail.smtp_port,
+        mailSmtpSecurity: mail.smtp_security,
       }))
       setCookieDirty(false)
       setApiKeyDirty(false)
+      setSmtpPasswordDirty(false)
     } catch (err) {
       setMessageKey(null)
       setMessage(err instanceof Error ? err.message : t.settings.saveError)
@@ -332,6 +387,167 @@ export function SettingsDialog() {
                 <p className="text-xs text-muted-foreground">
                   {t.settings.concurrencyHelp}
                 </p>
+              </div>
+              <div className="mt-2 grid gap-4 rounded-xl border border-border p-4">
+                <div className="grid gap-1">
+                  <p className="text-sm font-medium">{t.settings.mailTitle}</p>
+                  <p className="text-xs text-muted-foreground">{t.settings.mailDescription}</p>
+                </div>
+                <label className="flex items-center gap-2 text-sm">
+                  <Input
+                    type="checkbox"
+                    checked={settings.mailEnabled}
+                    onChange={(event) =>
+                      setSettings((current) => ({ ...current, mailEnabled: event.target.checked }))
+                    }
+                    className="size-4"
+                  />
+                  {t.settings.mailEnabled}
+                </label>
+                <div className="grid gap-2 sm:grid-cols-[1fr_8rem_9rem]">
+                  <div className="grid gap-2">
+                    <Label htmlFor="mailSmtpHost">{t.settings.mailSmtpHost}</Label>
+                    <Input
+                      id="mailSmtpHost"
+                      value={settings.mailSmtpHost}
+                      onChange={(event) =>
+                        setSettings((current) => ({ ...current, mailSmtpHost: event.target.value }))
+                      }
+                      placeholder="smtp.example.com"
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="mailSmtpPort">{t.settings.mailSmtpPort}</Label>
+                    <Input
+                      id="mailSmtpPort"
+                      inputMode="numeric"
+                      value={settings.mailSmtpPort}
+                      onChange={(event) =>
+                        setSettings((current) => ({
+                          ...current,
+                          mailSmtpPort: event.target.value.replace(/[^0-9]/g, ""),
+                        }))
+                      }
+                      placeholder="587"
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="mailSmtpSecurity">{t.settings.mailSmtpSecurity}</Label>
+                    <Select
+                      value={settings.mailSmtpSecurity}
+                      onValueChange={(value) => {
+                        if (value === "none" || value === "tls" || value === "ssl") {
+                          setSettings((current) => ({ ...current, mailSmtpSecurity: value }))
+                        }
+                      }}
+                    >
+                      <SelectTrigger id="mailSmtpSecurity">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="none">None</SelectItem>
+                        <SelectItem value="tls">STARTTLS</SelectItem>
+                        <SelectItem value="ssl">SSL/TLS</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="grid gap-2">
+                    <Label htmlFor="mailSmtpUsername">{t.settings.mailSmtpUsername}</Label>
+                    <Input
+                      id="mailSmtpUsername"
+                      value={settings.mailSmtpUsername}
+                      onChange={(event) =>
+                        setSettings((current) => ({ ...current, mailSmtpUsername: event.target.value }))
+                      }
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="mailSmtpPassword">{t.settings.mailSmtpPassword}</Label>
+                    <div className="relative">
+                      <Input
+                        id="mailSmtpPassword"
+                        type={showSmtpPassword ? "text" : "password"}
+                        value={settings.mailSmtpPassword}
+                        onFocus={(event) => {
+                          if (!smtpPasswordDirty && settings.mailSmtpPassword === SAVED_SMTP_PASSWORD_MASK) {
+                            event.currentTarget.select()
+                          }
+                        }}
+                        onChange={(event) => {
+                          setSmtpPasswordDirty(true)
+                          setSettings((current) => ({
+                            ...current,
+                            mailSmtpPassword: event.target.value.replace(SAVED_SMTP_PASSWORD_MASK, ""),
+                          }))
+                        }}
+                        placeholder={t.settings.mailSmtpPasswordPlaceholder}
+                        className="pr-9"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        className="absolute top-0.5 right-0.5"
+                        onClick={() => setShowSmtpPassword((current) => !current)}
+                      >
+                        {showSmtpPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                        <span className="sr-only">
+                          {showSmtpPassword ? t.settings.hideSmtpPassword : t.settings.showSmtpPassword}
+                        </span>
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="grid gap-2">
+                    <Label htmlFor="mailFromAddress">{t.settings.mailFromAddress}</Label>
+                    <Input
+                      id="mailFromAddress"
+                      value={settings.mailFromAddress}
+                      onChange={(event) =>
+                        setSettings((current) => ({ ...current, mailFromAddress: event.target.value }))
+                      }
+                      placeholder="youdub@example.com"
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="mailToAddresses">{t.settings.mailToAddresses}</Label>
+                    <Input
+                      id="mailToAddresses"
+                      value={settings.mailToAddresses}
+                      onChange={(event) =>
+                        setSettings((current) => ({ ...current, mailToAddresses: event.target.value }))
+                      }
+                      placeholder="user@example.com,ops@example.com"
+                    />
+                  </div>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="flex items-center gap-2 text-sm">
+                    <Input
+                      type="checkbox"
+                      checked={settings.mailNotifyOnSuccess}
+                      onChange={(event) =>
+                        setSettings((current) => ({ ...current, mailNotifyOnSuccess: event.target.checked }))
+                      }
+                      className="size-4"
+                    />
+                    {t.settings.mailNotifyOnSuccess}
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <Input
+                      type="checkbox"
+                      checked={settings.mailNotifyOnFailure}
+                      onChange={(event) =>
+                        setSettings((current) => ({ ...current, mailNotifyOnFailure: event.target.checked }))
+                      }
+                      className="size-4"
+                    />
+                    {t.settings.mailNotifyOnFailure}
+                  </label>
+                </div>
               </div>
               {visibleMessage ? <p className="text-sm text-muted-foreground">{visibleMessage}</p> : null}
             </div>

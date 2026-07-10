@@ -220,6 +220,12 @@ Common environment variables:
 | `LOCAL_UPLOAD_MAX_BYTES` | Maximum local video upload size. Default: 4 GiB. |
 | `LOCAL_SUBTITLE_MAX_BYTES` | Maximum optional local SRT subtitle upload size. Default: 20 MiB. |
 | `YTDLP_PROXY_PORT` | Local proxy port used by yt-dlp, for example `7890`. |
+| `MAIL_ENABLED` | Enable task success/failure email notifications. Default: `false`; can also be maintained from Settings. |
+| `MAIL_SMTP_HOST` / `MAIL_SMTP_PORT` | SMTP server host and port. Default port: `587`. |
+| `MAIL_SMTP_USERNAME` / `MAIL_SMTP_PASSWORD` | SMTP login credentials. The password is masked in API responses. |
+| `MAIL_FROM_ADDRESS` / `MAIL_TO_ADDRESSES` | Sender and recipient addresses. Separate multiple recipients with commas or semicolons. |
+| `MAIL_SMTP_SECURITY` | SMTP security mode: `none`, `tls` (STARTTLS), or `ssl`. Default: `tls`. |
+| `MAIL_NOTIFY_ON_SUCCESS` / `MAIL_NOTIFY_ON_FAILURE` | Send notifications on task success/failure. Both default to `true`. |
 | `HTTP_PROXY` / `ALL_PROXY` | yt-dlp reads `HTTP_PROXY` when no UI proxy port is set; HTTPX/OpenAI SDK also reads these environment proxies. |
 | `NO_PROXY` | Comma-separated proxy bypass list. Include `localhost,127.0.0.1,::1` when using a local OpenAI-compatible service so local requests stay direct. |
 | `VOXCPM_MODEL` / `VOXCPM_MODEL_DIR` | VoxCPM2 ModelScope model ID or local model directory. VoxCPM currently selects CUDA/MPS/CPU inside the upstream package, and task logs report it as `voxcpm=library-auto`. |
@@ -324,7 +330,7 @@ Local video uploads use the same later pipeline stages. If an already translated
 - **Resume after failure**: Failed tasks can resume from the failed stage, reusing cached outputs from stages that already succeeded.
 - **Rerun and clean up**: Rerun a task from scratch, or delete its database row, log file, and session directory under `workfolder/`.
 - **Inspect the result**: Successful tasks expose an inline video player and an mp4 download link.
-- **Settings in the UI**: YouTube cookies, yt-dlp proxy port, OpenAI base URL, API key, model name, and translation concurrency can be maintained from Settings.
+- **Settings in the UI**: YouTube cookies, yt-dlp proxy port, OpenAI base URL, API key, model name, translation concurrency, and SMTP email notifications for task success/failure can be maintained from Settings.
 - **Hackable architecture**: The pipeline is serial and module boundaries are clear, making it practical to replace ASR, translation, TTS, or subtitle rendering.
 
 ## Tech Stack

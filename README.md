@@ -220,6 +220,12 @@ cp env.txt.example .env
 | `LOCAL_UPLOAD_MAX_BYTES` | 本地视频上传大小上限，默认 4 GiB。 |
 | `LOCAL_SUBTITLE_MAX_BYTES` | 可选本地 SRT 字幕上传大小上限，默认 20 MiB。 |
 | `YTDLP_PROXY_PORT` | yt-dlp 使用的本机代理端口，例如 `7890`。 |
+| `MAIL_ENABLED` | 是否启用任务完成/失败邮件通知，默认 `false`；也可在设置弹窗中维护。 |
+| `MAIL_SMTP_HOST` / `MAIL_SMTP_PORT` | SMTP 服务器地址和端口，默认端口 `587`。 |
+| `MAIL_SMTP_USERNAME` / `MAIL_SMTP_PASSWORD` | SMTP 登录凭据；密码接口返回时会被掩码处理。 |
+| `MAIL_FROM_ADDRESS` / `MAIL_TO_ADDRESSES` | 发件人和收件人地址；多个收件人可用逗号或分号分隔。 |
+| `MAIL_SMTP_SECURITY` | SMTP 安全模式：`none`、`tls`（STARTTLS）或 `ssl`，默认 `tls`。 |
+| `MAIL_NOTIFY_ON_SUCCESS` / `MAIL_NOTIFY_ON_FAILURE` | 是否分别在任务成功/失败时发送邮件，默认均为 `true`。 |
 | `HTTP_PROXY` / `ALL_PROXY` | 未在 UI 中设置代理端口时，yt-dlp 可读取 `HTTP_PROXY`；HTTPX/OpenAI SDK 也会读取这些环境代理。 |
 | `NO_PROXY` | 逗号分隔的代理绕过列表；使用本地 OpenAI 兼容服务时建议包含 `localhost,127.0.0.1,::1`，避免本地请求绕行系统代理。 |
 | `VOXCPM_MODEL` / `VOXCPM_MODEL_DIR` | VoxCPM2 的 ModelScope 模型名或本地模型目录；VoxCPM 当前由上游包内部选择 CUDA/MPS/CPU，任务日志会显示为 `voxcpm=library-auto`。 |
@@ -324,7 +330,7 @@ YouTube / Bilibili URL
 - **失败可恢复**：失败任务可以从失败阶段继续执行，已成功阶段会复用缓存产物。
 - **可重跑可清理**：支持按任务 rerun，也支持删除任务记录、日志和 `workfolder/` 下的会话目录。
 - **结果可检查**：任务成功后可在页面内播放最终视频，也可以下载 mp4 文件。
-- **设置在 UI 内完成**：YouTube Cookie、yt-dlp 代理端口、OpenAI base URL、API key、模型名和翻译并发数都可在 Settings 中维护。
+- **设置在 UI 内完成**：YouTube Cookie、yt-dlp 代理端口、OpenAI base URL、API key、模型名、翻译并发数，以及任务成功/失败邮件通知的 SMTP 配置都可在 Settings 中维护。
 - **适合二次开发**：管线串行、模块边界清晰，方便替换 ASR、翻译、TTS 或字幕样式。
 
 ## 技术栈

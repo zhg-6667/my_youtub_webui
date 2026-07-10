@@ -53,3 +53,18 @@ def ytdlp_defaults() -> dict[str, str]:
     return {
         "proxy_port": os.getenv("YTDLP_PROXY_PORT", ""),
     }
+
+
+def mail_defaults() -> dict[str, str]:
+    return {
+        "enabled": os.getenv("MAIL_ENABLED", "false"),
+        "smtp_host": os.getenv("MAIL_SMTP_HOST", ""),
+        "smtp_port": os.getenv("MAIL_SMTP_PORT", "587"),
+        "smtp_username": os.getenv("MAIL_SMTP_USERNAME", ""),
+        "smtp_password": os.getenv("MAIL_SMTP_PASSWORD", ""),
+        "from_address": os.getenv("MAIL_FROM_ADDRESS", ""),
+        "to_addresses": os.getenv("MAIL_TO_ADDRESSES", ""),
+        "smtp_security": os.getenv("MAIL_SMTP_SECURITY", "tls"),
+        "notify_on_success": os.getenv("MAIL_NOTIFY_ON_SUCCESS", "true"),
+        "notify_on_failure": os.getenv("MAIL_NOTIFY_ON_FAILURE", "true"),
+    }

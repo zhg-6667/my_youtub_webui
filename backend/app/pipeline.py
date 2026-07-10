@@ -115,6 +115,7 @@ class PipelineRunner:
                 completed_at=database.now_iso(),
             )
             self.log("Task succeeded")
+            self._notify_task_completion("succeeded")
         except Exception as exc:
             current = database.get_task(self.task_id)
             failed_stage = current["current_stage"] if current else None
@@ -135,6 +136,12 @@ class PipelineRunner:
             )
             self.log("Task failed")
             self.log(traceback.format_exc())
+            self._notify_task_completion("failed")
+
+    def _notify_task_completion(self, event: str) -> None:
+        from .notifications import notify_task_completion
+
+        notify_task_completion(self.task_id, event, self.log)
 
     def log(self, message: str) -> None:
         _write_log(self.task_id, message)
