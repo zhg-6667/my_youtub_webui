@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 # 脚本固定约定
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TAGS = "中配,狼叔,宝可梦"
+DEFAULT_TAGS = "狼叔,宝可梦,神奇宝贝,VGC,WolfeyVGC,对战游戏,Pokemon,口袋妖怪"
 DEFAULT_TID = 17  # 单机游戏
 COPYRIGHT_SELF = 1  # 自制
 VIDEO_NAME = "video_final_trimmed.mp4"
