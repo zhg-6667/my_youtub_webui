@@ -8,8 +8,10 @@ import {
   Download,
   FileText,
   Loader2,
+  Plus,
   Play,
   RotateCw,
+  Save,
   Send,
   Trash2,
   XCircle,
@@ -18,6 +20,7 @@ import {
 import {
   BilibiliPublishMode,
   BilibiliUploadJob,
+  CutInterval,
   ExecutionMode,
   StageStatus,
   Task,
@@ -30,12 +33,14 @@ import {
   finalVideoDownloadUrl,
   finalVideoUrl,
   getBilibiliUploadJob,
+  getCutIntervals,
   getTask,
   getTaskLog,
   getWatermarkMaskJob,
   redoStage,
   rerunTask,
   resumeTask,
+  saveCutIntervals,
   trimVideo,
 } from "@/lib/api"
 import { useI18n } from "@/lib/i18n"
@@ -102,6 +107,43 @@ function normalizeProgress(value: number | null | undefined) {
   return Math.max(0, Math.min(100, Math.round(value)))
 }
 
+function localDatePart(date = new Date()) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  return `${year}-${month}-${day}`
+}
+
+type TrimRangeInput = {
+  id: string
+  startMin: string
+  startSec: string
+  endMin: string
+  endSec: string
+}
+
+function emptyTrimRange(): TrimRangeInput {
+  return {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    startMin: "",
+    startSec: "",
+    endMin: "",
+    endSec: "",
+  }
+}
+
+function secondsToRange(interval: CutInterval): TrimRangeInput {
+  const start = Math.max(0, Math.floor(interval.start))
+  const end = Math.max(0, Math.floor(interval.end))
+  return {
+    id: emptyTrimRange().id,
+    startMin: String(Math.floor(start / 60)),
+    startSec: String(start % 60),
+    endMin: String(Math.floor(end / 60)),
+    endSec: String(end % 60),
+  }
+}
+
 export default function TaskDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params)
   const router = useRouter()
@@ -124,6 +166,9 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [redoError, setRedoError] = useState("")
   const [trimming, setTrimming] = useState(false)
   const [trimError, setTrimError] = useState("")
+  const [savingTrimIntervals, setSavingTrimIntervals] = useState(false)
+  const [trimSavedMessage, setTrimSavedMessage] = useState("")
+  const [trimRanges, setTrimRanges] = useState<TrimRangeInput[]>([emptyTrimRange()])
   const [bilibiliOpen, setBilibiliOpen] = useState(false)
   const [bilibiliTitle, setBilibiliTitle] = useState("")
   const [bilibiliPublishMode, setBilibiliPublishMode] = useState<BilibiliPublishMode>("now")
@@ -210,11 +255,62 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     if (succeeded) setRedoConfirmStage(null)
   }
 
+  const parseTrimRanges = () => {
+    const intervals: CutInterval[] = []
+    for (const range of trimRanges) {
+      const values = [range.startMin, range.startSec, range.endMin, range.endSec].map((value) => value.trim())
+      if (values.every((value) => !value)) continue
+      if (values.some((value) => value === "" || !/^\d+$/.test(value))) {
+        throw new Error(t.task.trimIntervalInvalid)
+      }
+      const [startMin, startSec, endMin, endSec] = values.map(Number)
+      if (startSec > 59 || endSec > 59) {
+        throw new Error(t.task.trimSecondInvalid)
+      }
+      const start = startMin * 60 + startSec
+      const end = endMin * 60 + endSec
+      if (end <= start) {
+        throw new Error(t.task.trimEndInvalid)
+      }
+      intervals.push({ start, end })
+    }
+    return intervals
+  }
+
+  const handleTrimRangeChange = (rangeId: string, field: keyof Omit<TrimRangeInput, "id">, value: string) => {
+    const digits = value.replace(/\D/g, "")
+    setTrimRanges((current) =>
+      current.map((range) => (range.id === rangeId ? { ...range, [field]: digits } : range)),
+    )
+    setTrimSavedMessage("")
+  }
+
+  const handleSaveTrimIntervals = async () => {
+    setSavingTrimIntervals(true)
+    setTrimError("")
+    setTrimSavedMessage("")
+    try {
+      const intervals = parseTrimRanges()
+      const saved = await saveCutIntervals(id, intervals)
+      setTrimRanges(saved.cut_intervals.length ? saved.cut_intervals.map(secondsToRange) : [emptyTrimRange()])
+      setTrimSavedMessage(t.task.trimIntervalsSaved)
+    } catch (err) {
+      setTrimError(err instanceof Error ? err.message : t.task.trimStageError)
+    } finally {
+      setSavingTrimIntervals(false)
+    }
+  }
+
   const handleTrim = async () => {
     setTrimming(true)
     setTrimError("")
+    setTrimSavedMessage("")
     try {
-      const next = await trimVideo(id)
+      const intervals = parseTrimRanges()
+      if (!intervals.length) {
+        throw new Error(t.task.trimIntervalRequired)
+      }
+      const next = await trimVideo(id, intervals)
       setTask(next)
     } catch (err) {
       setTrimError(err instanceof Error ? err.message : t.task.trimStageError)
@@ -251,6 +347,11 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     }
   }
 
+  const handleQuickBilibiliDtime = (time: string) => {
+    const datePart = bilibiliDtime.includes("T") ? bilibiliDtime.split("T")[0] : localDatePart()
+    setBilibiliDtime(`${datePart}T${time}`)
+  }
+
   const handleCreateWatermarkMask = async () => {
     setWatermarkError("")
     setCreatingWatermarkJob(true)
@@ -272,6 +373,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const isBilibiliTask = task?.source_name === "bilibili"
   const canRedoStage = isManual && !isRunning && !isQueued
   const canTrim = !isRunning && !isQueued
+  const canEditTrimIntervals = Boolean(task) && !(task.status === "running" && task.current_stage === "trim_video")
   const redoConfirmStageInfo = task?.stages.find((stage) => stage.name === redoConfirmStage)
 
   useEffect(() => {
@@ -295,6 +397,23 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
       window.clearInterval(interval)
     }
   }, [id, t.task.loadError])
+
+  useEffect(() => {
+    let cancelled = false
+    const loadIntervals = async () => {
+      try {
+        const result = await getCutIntervals(id)
+        if (cancelled) return
+        setTrimRanges(result.cut_intervals.length ? result.cut_intervals.map(secondsToRange) : [emptyTrimRange()])
+      } catch {
+        if (!cancelled) setTrimRanges([emptyTrimRange()])
+      }
+    }
+    loadIntervals()
+    return () => {
+      cancelled = true
+    }
+  }, [id])
 
   useEffect(() => {
     if (!bilibiliJob || !["queued", "running"].includes(bilibiliJob.status)) return
@@ -480,6 +599,35 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                             onChange={(event) => setBilibiliDtime(event.target.value)}
                             disabled={creatingBilibiliJob}
                           />
+                          <div className="flex flex-wrap gap-2">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => handleQuickBilibiliDtime("05:00")}
+                              disabled={creatingBilibiliJob}
+                            >
+                              {t.task.bilibiliQuickMorning}
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => handleQuickBilibiliDtime("11:00")}
+                              disabled={creatingBilibiliJob}
+                            >
+                              {t.task.bilibiliQuickNoon}
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => handleQuickBilibiliDtime("19:30")}
+                              disabled={creatingBilibiliJob}
+                            >
+                              {t.task.bilibiliQuickEvening}
+                            </Button>
+                          </div>
                         </div>
                       ) : null}
                       {bilibiliError ? (
@@ -585,8 +733,112 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
             {isManual && canRedoStage ? (
               <p className="mb-3 text-sm text-muted-foreground">{t.task.redoStageHelp}</p>
             ) : null}
-            {canTrim && task?.stages.some((s) => s.name === "trim_video") ? (
-              <p className="mb-3 text-sm text-muted-foreground">{t.task.trimStageHelp}</p>
+            {task?.stages.some((s) => s.name === "trim_video") ? (
+              <div className="mb-4 space-y-3 rounded-lg border border-sky-100 bg-sky-50 px-3 py-3">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm text-sky-950">{t.task.trimStageHelp}</p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="self-start bg-background"
+                    onClick={() => setTrimRanges((current) => [...current, emptyTrimRange()])}
+                    disabled={!canEditTrimIntervals}
+                  >
+                    <Plus className="size-3" />
+                    {t.task.addTrimInterval}
+                  </Button>
+                </div>
+                <div className="grid gap-2">
+                  {trimRanges.map((range, index) => (
+                    <div
+                      key={range.id}
+                      className="grid grid-cols-[1fr_auto_1fr_auto] items-end gap-2 rounded-md border border-sky-100 bg-background p-2 sm:grid-cols-[auto_72px_72px_auto_72px_72px_auto]"
+                    >
+                      <span className="col-span-4 text-xs font-medium text-muted-foreground sm:col-span-1">
+                        {t.task.trimIntervalLabel} {index + 1}
+                      </span>
+                      <Input
+                        aria-label={`${t.task.trimStartMinute} ${index + 1}`}
+                        inputMode="numeric"
+                        value={range.startMin}
+                        onChange={(event) => handleTrimRangeChange(range.id, "startMin", event.target.value)}
+                        placeholder={t.task.trimMinutePlaceholder}
+                        disabled={!canEditTrimIntervals}
+                        className="h-9"
+                      />
+                      <Input
+                        aria-label={`${t.task.trimStartSecond} ${index + 1}`}
+                        inputMode="numeric"
+                        value={range.startSec}
+                        onChange={(event) => handleTrimRangeChange(range.id, "startSec", event.target.value)}
+                        placeholder={t.task.trimSecondPlaceholder}
+                        disabled={!canEditTrimIntervals}
+                        className="h-9"
+                      />
+                      <span className="pb-2 text-center text-xs text-muted-foreground">{t.task.trimTo}</span>
+                      <Input
+                        aria-label={`${t.task.trimEndMinute} ${index + 1}`}
+                        inputMode="numeric"
+                        value={range.endMin}
+                        onChange={(event) => handleTrimRangeChange(range.id, "endMin", event.target.value)}
+                        placeholder={t.task.trimMinutePlaceholder}
+                        disabled={!canEditTrimIntervals}
+                        className="h-9"
+                      />
+                      <Input
+                        aria-label={`${t.task.trimEndSecond} ${index + 1}`}
+                        inputMode="numeric"
+                        value={range.endSec}
+                        onChange={(event) => handleTrimRangeChange(range.id, "endSec", event.target.value)}
+                        placeholder={t.task.trimSecondPlaceholder}
+                        disabled={!canEditTrimIntervals}
+                        className="h-9"
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        className="h-9 w-9"
+                        onClick={() =>
+                          setTrimRanges((current) =>
+                            current.length > 1 ? current.filter((item) => item.id !== range.id) : [emptyTrimRange()],
+                          )
+                        }
+                        disabled={!canEditTrimIntervals}
+                        aria-label={t.task.removeTrimInterval}
+                      >
+                        <Trash2 className="size-3" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="bg-background"
+                    onClick={handleSaveTrimIntervals}
+                    disabled={!canEditTrimIntervals || savingTrimIntervals}
+                  >
+                    {savingTrimIntervals ? <Loader2 className="size-3 animate-spin" /> : <Save className="size-3" />}
+                    {savingTrimIntervals ? t.task.savingTrimIntervals : t.task.saveTrimIntervals}
+                  </Button>
+                  {canTrim ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={handleTrim}
+                      disabled={trimming}
+                    >
+                      {trimming ? <Loader2 className="size-3 animate-spin" /> : <RotateCw className="size-3" />}
+                      {trimming ? t.task.trimmingStage : t.task.trimStage}
+                    </Button>
+                  ) : null}
+                  {trimSavedMessage ? <span className="text-xs text-emerald-700">{trimSavedMessage}</span> : null}
+                </div>
+              </div>
             ) : null}
             {redoError ? (
               <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
@@ -634,22 +886,6 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                                 <RotateCw className="size-3" />
                               )}
                               {redoingStage === stage.name ? t.task.redoingStage : t.task.redoStage}
-                            </Button>
-                          ) : null}
-                          {canTrim && stage.name === "trim_video" ? (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="ml-auto h-7 px-2 text-xs"
-                              disabled={trimming}
-                              onClick={handleTrim}
-                            >
-                              {trimming ? (
-                                <Loader2 className="size-3 animate-spin" />
-                              ) : (
-                                <RotateCw className="size-3" />
-                              )}
-                              {trimming ? t.task.trimmingStage : t.task.trimStage}
                             </Button>
                           ) : null}
                         </div>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -548,6 +549,100 @@ def test_continue_task_rejects_auto_task(monkeypatch, tmp_path):
     response = client.post(f"/api/tasks/{task_id}/continue")
 
     assert response.status_code == 409
+
+
+def test_cut_intervals_can_be_saved_before_session_exists(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=cutranges001", task_id="cutranges001")
+    client = TestClient(main.app)
+
+    response = client.put(
+        f"/api/tasks/{task_id}/cut-intervals",
+        json={
+            "cut_intervals": [
+                {"start": 370, "end": 380},
+                {"start": 430, "end": 450},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cut_intervals"] == [
+        {"start": 370.0, "end": 380.0},
+        {"start": 430.0, "end": 450.0},
+    ]
+    task = database.get_task(task_id)
+    assert json.loads(task["cut_intervals_json"]) == response.json()["cut_intervals"]
+
+    loaded = client.get(f"/api/tasks/{task_id}/cut-intervals")
+    assert loaded.status_code == 200
+    assert loaded.json() == response.json()
+
+
+def test_cut_intervals_sync_to_session_file(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "cut-session"
+    task_id = database.create_task("https://www.youtube.com/watch?v=cutranges002", task_id="cutranges002")
+    database.update_task(task_id, session_path=str(session))
+    client = TestClient(main.app)
+
+    response = client.put(
+        f"/api/tasks/{task_id}/cut-intervals",
+        json={"cut_intervals": [{"start": 430, "end": 450}, {"start": 370, "end": 380}]},
+    )
+
+    assert response.status_code == 200
+    intervals_file = session / "metadata" / "cut_intervals.json"
+    assert json.loads(intervals_file.read_text(encoding="utf-8")) == [
+        {"start": 370.0, "end": 380.0},
+        {"start": 430.0, "end": 450.0},
+    ]
+
+
+def test_trim_video_accepts_minute_second_ranges_as_seconds(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "trim-session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final = media / "video_final.mp4"
+    final.write_bytes(b"video")
+    task_id = database.create_task("https://www.youtube.com/watch?v=cutranges003", task_id="cutranges003")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(final))
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/trim",
+        json={
+            "cut_intervals": [
+                {"start": 6 * 60 + 10, "end": 6 * 60 + 20},
+                {"start": 7 * 60 + 10, "end": 7 * 60 + 30},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert enqueued == [task_id]
+    intervals_file = session / "metadata" / "cut_intervals.json"
+    assert json.loads(intervals_file.read_text(encoding="utf-8")) == [
+        {"start": 370.0, "end": 380.0},
+        {"start": 430.0, "end": 450.0},
+    ]
+    assert response.json()["status"] == "queued"
+
+
+def test_cut_intervals_reject_invalid_ranges(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=cutranges004", task_id="cutranges004")
+    client = TestClient(main.app)
+
+    response = client.put(
+        f"/api/tasks/{task_id}/cut-intervals",
+        json={"cut_intervals": [{"start": 450, "end": 430}]},
+    )
+
+    assert response.status_code == 422
 
 
 def test_redo_stage_requeues_manual_task(monkeypatch, tmp_path):

@@ -483,6 +483,11 @@ class PipelineRunner:
 
         intervals_file = session / "metadata" / "cut_intervals.json"
         if not intervals_file.exists():
+            saved_intervals = database.get_task_cut_intervals(self.task_id)
+            if saved_intervals:
+                intervals_file.parent.mkdir(parents=True, exist_ok=True)
+                intervals_file.write_text(saved_intervals, encoding="utf-8")
+        if not intervals_file.exists():
             self.artifacts.trimmed_video = final_video
             self.stage_message("trim_video", "No cut intervals; keeping original video")
             return

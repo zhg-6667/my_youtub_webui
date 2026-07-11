@@ -38,6 +38,7 @@ def init_db() -> None:
               current_stage TEXT,
               session_path TEXT,
               final_video_path TEXT,
+              cut_intervals_json TEXT,
               error_message TEXT,
               created_at TEXT NOT NULL,
               started_at TEXT,
@@ -122,6 +123,8 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'auto'"
             )
+        if "cut_intervals_json" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN cut_intervals_json TEXT")
         stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_stages)").fetchall()}
         if "progress" not in stage_columns:
             conn.execute("ALTER TABLE task_stages ADD COLUMN progress INTEGER")
@@ -356,6 +359,20 @@ def update_task(task_id: str, **fields: Any) -> None:
     values = list(fields.values()) + [task_id]
     with connect() as conn:
         conn.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", values)
+
+
+def get_task_cut_intervals(task_id: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute("SELECT cut_intervals_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row["cut_intervals_json"] if row else None
+
+
+def save_task_cut_intervals(task_id: str, intervals_json: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET cut_intervals_json = ? WHERE id = ?",
+            (intervals_json, task_id),
+        )
 
 
 def update_stage(task_id: str, name: str, **fields: Any) -> None:

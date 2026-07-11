@@ -114,6 +114,7 @@ export type MailSettings = {
 }
 
 export type LocalDirection = "en-zh" | "zh-en"
+export type CutInterval = { start: number; end: number }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -289,7 +290,18 @@ export function saveMailSettings(settings: MailSettingsSave) {
   })
 }
 
-export function trimVideo(taskId: string, cutIntervals?: { start: number; end: number }[]) {
+export function getCutIntervals(taskId: string) {
+  return request<{ cut_intervals: CutInterval[] }>(`/api/tasks/${taskId}/cut-intervals`)
+}
+
+export function saveCutIntervals(taskId: string, cutIntervals: CutInterval[]) {
+  return request<{ cut_intervals: CutInterval[] }>(`/api/tasks/${taskId}/cut-intervals`, {
+    method: "PUT",
+    body: JSON.stringify({ cut_intervals: cutIntervals }),
+  })
+}
+
+export function trimVideo(taskId: string, cutIntervals?: CutInterval[]) {
   return request<Task>(`/api/tasks/${taskId}/trim`, {
     method: "POST",
     body: JSON.stringify(cutIntervals?.length ? { cut_intervals: cutIntervals } : {}),

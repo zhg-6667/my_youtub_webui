@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+import json as _json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
@@ -10,7 +11,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import bilibili_uploads, database, watermark_masks, worker
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
@@ -55,6 +56,15 @@ class BilibiliUploadRequest(BaseModel):
 
 class WatermarkMaskRequest(BaseModel):
     mode: str = "patch"
+
+
+class CutInterval(BaseModel):
+    start: float
+    end: float
+
+
+class CutIntervalsRequest(BaseModel):
+    cut_intervals: list[CutInterval] = Field(default_factory=list)
 
 
 class YouTubeCookieUpdate(BaseModel):
@@ -142,6 +152,50 @@ def normalize_proxy_port(value: str) -> str:
     if port < 1 or port > 65535:
         raise HTTPException(status_code=422, detail="Proxy port must be between 1 and 65535.")
     return str(port)
+
+
+def normalize_cut_intervals(intervals: list[CutInterval]) -> list[dict[str, float]]:
+    normalized: list[dict[str, float]] = []
+    for interval in intervals:
+        start = float(interval.start)
+        end = float(interval.end)
+        if start < 0 or end < 0:
+            raise HTTPException(status_code=422, detail="Cut interval times must be non-negative.")
+        if end <= start:
+            raise HTTPException(status_code=422, detail="Cut interval end must be after start.")
+        normalized.append({"start": round(start, 3), "end": round(end, 3)})
+    normalized.sort(key=lambda item: item["start"])
+    return normalized
+
+
+def cut_intervals_file(session_path: str | None) -> Path | None:
+    if not session_path:
+        return None
+    return Path(session_path) / "metadata" / "cut_intervals.json"
+
+
+def sync_cut_intervals_to_session(task: dict, intervals: list[dict[str, float]]) -> None:
+    intervals_file = cut_intervals_file(task.get("session_path"))
+    if intervals_file is None:
+        return
+    intervals_file.parent.mkdir(parents=True, exist_ok=True)
+    intervals_file.write_text(_json.dumps(intervals, ensure_ascii=False), encoding="utf-8")
+
+
+def task_cut_intervals(task: dict) -> list[dict[str, float]]:
+    saved = task.get("cut_intervals_json") or database.get_task_cut_intervals(task["id"])
+    if saved:
+        try:
+            return normalize_cut_intervals([CutInterval(**item) for item in _json.loads(saved)])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail="Stored cut intervals are invalid.") from exc
+    intervals_file = cut_intervals_file(task.get("session_path"))
+    if intervals_file and intervals_file.exists():
+        try:
+            return normalize_cut_intervals([CutInterval(**item) for item in _json.loads(intervals_file.read_text(encoding="utf-8"))])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail="cut_intervals.json is invalid.") from exc
+    return []
 
 
 def normalize_translate_concurrency(value: str) -> str:
@@ -452,12 +506,28 @@ def redo_stage(task_id: str, stage_name: str) -> dict:
     return _task_with_source(database.get_task(task_id))
 
 
-class TrimVideoRequest(BaseModel):
-    cut_intervals: list[dict] | None = None
+@app.get("/api/tasks/{task_id}/cut-intervals")
+def get_cut_intervals(task_id: str) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return {"cut_intervals": task_cut_intervals(task)}
+
+
+@app.put("/api/tasks/{task_id}/cut-intervals")
+def save_cut_intervals(task_id: str, payload: CutIntervalsRequest) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    intervals = normalize_cut_intervals(payload.cut_intervals)
+    serialized = _json.dumps(intervals, ensure_ascii=False)
+    database.save_task_cut_intervals(task_id, serialized)
+    sync_cut_intervals_to_session(task, intervals)
+    return {"cut_intervals": intervals}
 
 
 @app.post("/api/tasks/{task_id}/trim")
-def trim_video_task(task_id: str, payload: TrimVideoRequest | None = None) -> dict:
+def trim_video_task(task_id: str, payload: CutIntervalsRequest | None = None) -> dict:
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
@@ -467,16 +537,22 @@ def trim_video_task(task_id: str, payload: TrimVideoRequest | None = None) -> di
     if not session_path:
         raise HTTPException(status_code=400, detail="Task has no session path; run the pipeline first.")
 
-    import json as _json
-
     session = Path(session_path)
     metadata_dir = session / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     intervals_file = metadata_dir / "cut_intervals.json"
 
-    if payload and payload.cut_intervals:
-        intervals_file.write_text(_json.dumps(payload.cut_intervals, ensure_ascii=False), encoding="utf-8")
-    elif not intervals_file.exists():
+    if payload is not None:
+        intervals = normalize_cut_intervals(payload.cut_intervals)
+        serialized = _json.dumps(intervals, ensure_ascii=False)
+        database.save_task_cut_intervals(task_id, serialized)
+        intervals_file.write_text(serialized, encoding="utf-8")
+    else:
+        intervals = task_cut_intervals(task)
+        if intervals:
+            intervals_file.write_text(_json.dumps(intervals, ensure_ascii=False), encoding="utf-8")
+
+    if not intervals_file.exists():
         raise HTTPException(status_code=400, detail="No cut intervals provided and cut_intervals.json not found.")
 
     trimmed = session / "media" / "video_final_trimmed.mp4"
