@@ -70,11 +70,13 @@ def _run_job(job_id: str) -> None:
     from scripts.upload_bilibili import UploadBilibiliError, UploadBilibiliOptions, upload_bilibili
 
     try:
+        bilibili_settings = database.get_bilibili_settings()
         result = upload_bilibili(
             UploadBilibiliOptions(
                 path=session_path,
                 title=job["title"],
                 dtime=job["dtime"],
+                author_tags_json=bilibili_settings["author_tags_json"],
             )
         )
     except UploadBilibiliError as exc:

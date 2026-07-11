@@ -41,6 +41,7 @@ export type Task = {
   started_at: string | null
   completed_at: string | null
   execution_mode: ExecutionMode
+  auto_bilibili_upload: boolean
   source_name?: string
   stages: TaskStage[]
 }
@@ -99,6 +100,10 @@ export type YtdlpSettings = {
   proxy_port: string
 }
 
+export type BilibiliSettings = {
+  author_tags_json: string
+}
+
 export type MailSettings = {
   enabled: boolean
   smtp_host: string
@@ -147,6 +152,7 @@ export type TaskSummary = {
   started_at: string | null
   completed_at: string | null
   execution_mode?: ExecutionMode
+  auto_bilibili_upload?: boolean
   source_name?: string
 }
 
@@ -193,10 +199,18 @@ export function redoStage(taskId: string, stageName: string) {
   return request<Task>(`/api/tasks/${taskId}/stages/${stageName}/redo`, { method: "POST" })
 }
 
-export function createTask(url: string, executionMode: ExecutionMode = "auto") {
+export function createTask(
+  url: string,
+  executionMode: ExecutionMode = "auto",
+  autoBilibiliUpload = false,
+) {
   return request<Task>("/api/tasks", {
     method: "POST",
-    body: JSON.stringify({ url, execution_mode: executionMode }),
+    body: JSON.stringify({
+      url,
+      execution_mode: executionMode,
+      auto_bilibili_upload: autoBilibiliUpload,
+    }),
   })
 }
 
@@ -205,6 +219,7 @@ export async function uploadLocalTask(
   direction: LocalDirection,
   subtitleFile: File | null = null,
   executionMode: ExecutionMode = "auto",
+  autoBilibiliUpload = false,
 ) {
   const form = new FormData()
   form.append("direction", direction)
@@ -213,6 +228,7 @@ export async function uploadLocalTask(
     form.append("subtitle_file", subtitleFile)
   }
   form.append("execution_mode", executionMode)
+  form.append("auto_bilibili_upload", autoBilibiliUpload ? "true" : "false")
 
   const response = await fetch(`${API_BASE}/api/tasks/upload`, {
     method: "POST",
@@ -270,6 +286,17 @@ export function getYtdlpSettings() {
 
 export function saveYtdlpSettings(settings: YtdlpSettings) {
   return request<YtdlpSettings>("/api/settings/ytdlp", {
+    method: "POST",
+    body: JSON.stringify(settings),
+  })
+}
+
+export function getBilibiliSettings() {
+  return request<BilibiliSettings>("/api/settings/bilibili")
+}
+
+export function saveBilibiliSettings(settings: BilibiliSettings) {
+  return request<BilibiliSettings>("/api/settings/bilibili", {
     method: "POST",
     body: JSON.stringify(settings),
   })

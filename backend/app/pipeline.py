@@ -115,6 +115,7 @@ class PipelineRunner:
                 completed_at=database.now_iso(),
             )
             self.log("Task succeeded")
+            self._maybe_enqueue_auto_bilibili_upload()
             self._notify_task_completion("succeeded")
         except Exception as exc:
             current = database.get_task(self.task_id)
@@ -142,6 +143,33 @@ class PipelineRunner:
         from .notifications import notify_task_completion
 
         notify_task_completion(self.task_id, event, self.log)
+
+    def _maybe_enqueue_auto_bilibili_upload(self) -> None:
+        task = database.get_task(self.task_id)
+        if not task or not task.get("auto_bilibili_upload"):
+            return
+        if database.get_active_bilibili_upload_job(self.task_id):
+            self.log("[bilibili_upload] Auto publish skipped: upload job already active")
+            return
+        title = (task.get("title") or "").strip()
+        if not title and task.get("session_path"):
+            metadata = Path(task["session_path"]) / "metadata" / "ytdlp_info.json"
+            if metadata.exists():
+                try:
+                    title = (json.loads(metadata.read_text(encoding="utf-8")).get("title") or "").strip()
+                except (OSError, json.JSONDecodeError):
+                    title = ""
+        if not title:
+            title = task["id"]
+        from . import bilibili_uploads
+
+        job_id = database.create_bilibili_upload_job(
+            self.task_id,
+            title=title,
+            publish_mode="now",
+        )
+        bilibili_uploads.enqueue(job_id)
+        self.log(f"[bilibili_upload] Auto publish queued: {job_id}")
 
     def log(self, message: str) -> None:
         _write_log(self.task_id, message)

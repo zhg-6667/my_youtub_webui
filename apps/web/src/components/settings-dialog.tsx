@@ -4,11 +4,13 @@ import { FormEvent, useEffect, useState } from "react"
 import { Eye, EyeOff, RefreshCw, Settings } from "lucide-react"
 
 import {
+  getBilibiliSettings,
   getCookieInfo,
   getMailSettings,
   getOpenAIModels,
   getOpenAISettings,
   getYtdlpSettings,
+  saveBilibiliSettings,
   saveCookie,
   saveMailSettings,
   saveOpenAISettings,
@@ -43,6 +45,7 @@ type SettingsForm = {
   model: string
   translateConcurrency: string
   proxyPort: string
+  bilibiliAuthorTagsJson: string
   mailEnabled: boolean
   mailSmtpHost: string
   mailSmtpPort: string
@@ -68,6 +71,7 @@ const defaultSettings: SettingsForm = {
   model: "gpt-4o-mini",
   translateConcurrency: "50",
   proxyPort: "",
+  bilibiliAuthorTagsJson: "",
   mailEnabled: false,
   mailSmtpHost: "",
   mailSmtpPort: "587",
@@ -106,8 +110,8 @@ export function SettingsDialog() {
 
   useEffect(() => {
     if (!open) return
-    Promise.all([getCookieInfo(), getOpenAISettings(), getYtdlpSettings(), getMailSettings()])
-      .then(([cookie, openai, ytdlp, mail]) => {
+    Promise.all([getCookieInfo(), getOpenAISettings(), getYtdlpSettings(), getBilibiliSettings(), getMailSettings()])
+      .then(([cookie, openai, ytdlp, bilibili, mail]) => {
         setSettings({
           cookie: cookie.exists ? SAVED_COOKIE_SENTINEL : "",
           baseUrl: openai.base_url,
@@ -115,6 +119,7 @@ export function SettingsDialog() {
           model: openai.model,
           translateConcurrency: openai.translate_concurrency || "50",
           proxyPort: ytdlp.proxy_port,
+          bilibiliAuthorTagsJson: bilibili.author_tags_json,
           mailEnabled: mail.enabled,
           mailSmtpHost: mail.smtp_host,
           mailSmtpPort: mail.smtp_port || "587",
@@ -157,6 +162,7 @@ export function SettingsDialog() {
         translate_concurrency: settings.translateConcurrency,
       })
       const ytdlp = await saveYtdlpSettings({ proxy_port: settings.proxyPort })
+      const bilibili = await saveBilibiliSettings({ author_tags_json: settings.bilibiliAuthorTagsJson })
       const clearSmtpPassword = smtpPasswordDirty && !settings.mailSmtpPassword.trim()
       const mail = await saveMailSettings({
         enabled: settings.mailEnabled,
@@ -178,6 +184,7 @@ export function SettingsDialog() {
         cookie: cookieDirty ? (cookie?.exists ? SAVED_COOKIE_SENTINEL : "") : current.cookie,
         translateConcurrency: openai.translate_concurrency || current.translateConcurrency,
         proxyPort: ytdlp.proxy_port,
+        bilibiliAuthorTagsJson: bilibili.author_tags_json,
         mailSmtpPassword: mail.has_smtp_password ? mail.smtp_password || SAVED_SMTP_PASSWORD_MASK : "",
         mailSmtpPort: mail.smtp_port,
         mailSmtpSecurity: mail.smtp_security,
@@ -282,6 +289,19 @@ export function SettingsDialog() {
                   }
                   placeholder="7890"
                 />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="bilibiliAuthorTagsJson">{t.settings.bilibiliAuthorTags}</Label>
+                <Textarea
+                  id="bilibiliAuthorTagsJson"
+                  value={settings.bilibiliAuthorTagsJson}
+                  onChange={(event) =>
+                    setSettings((current) => ({ ...current, bilibiliAuthorTagsJson: event.target.value }))
+                  }
+                  placeholder={'{"WolfeyVGC":"狼叔,宝可梦,VGC","SomeCreator":"科技,科普"}'}
+                  className="min-h-24 font-mono text-xs leading-relaxed"
+                />
+                <p className="text-xs text-muted-foreground">{t.settings.bilibiliAuthorTagsHelp}</p>
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="baseUrl">{t.settings.baseUrl}</Label>

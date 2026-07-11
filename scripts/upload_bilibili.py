@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -29,7 +30,11 @@ from urllib.parse import parse_qs, urlparse
 
 # 脚本固定约定
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TAGS = "狼叔,宝可梦,神奇宝贝,VGC,WolfeyVGC,对战游戏,Pokemon,口袋妖怪"
+WOLFEY_TAGS = "狼叔,宝可梦,神奇宝贝,VGC,WolfeyVGC,对战游戏,Pokemon,口袋妖怪"
+DEFAULT_TAGS = {
+    "WolfeyVGC": WOLFEY_TAGS,
+}
+AUTHOR_TAGS_ENV = "BILIBILI_AUTHOR_TAGS_JSON"
 DEFAULT_TID = 17  # 单机游戏
 COPYRIGHT_SELF = 1  # 自制
 VIDEO_NAME = "video_final_trimmed.mp4"
@@ -60,13 +65,14 @@ class UploadBilibiliError(RuntimeError):
 class UploadBilibiliOptions:
     path: str
     title: str
-    tag: str = DEFAULT_TAGS
+    tag: str | None = None
     tid: int = DEFAULT_TID
     cover: str | None = None
     desc: str | None = None
     dtime: str | None = None
     cookie: str | None = None
     biliup: str | None = None
+    author_tags_json: str | None = None
     dry_run: bool = False
 
 
@@ -156,6 +162,34 @@ def build_desc(info: dict) -> str:
     )
 
 
+def author_name(info: dict) -> str:
+    return str(info.get("uploader") or info.get("channel") or "").strip()
+
+
+def author_tags_config(raw_config: str | None = None) -> dict[str, str]:
+    configured = dict(DEFAULT_TAGS)
+    raw = (raw_config if raw_config is not None else os.getenv(AUTHOR_TAGS_ENV, "")).strip()
+    if not raw:
+        return configured
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"{AUTHOR_TAGS_ENV} 不是有效 JSON：{exc}")
+    if not isinstance(loaded, dict):
+        fail(f"{AUTHOR_TAGS_ENV} 必须是作者到标签字符串的 JSON 对象。")
+    for author, tags in loaded.items():
+        if not isinstance(author, str) or not isinstance(tags, str):
+            fail(f"{AUTHOR_TAGS_ENV} 的键和值都必须是字符串。")
+        configured[author.strip()] = tags.strip()
+    return configured
+
+
+def default_tags_for_author(author: str, raw_config: str | None = None) -> str:
+    if not author:
+        return ""
+    return author_tags_config(raw_config).get(author, "")
+
+
 def download_cover(vid: str, dest: Path) -> "Path | None":
     """下载 YouTube 封面（maxres 失败回退 hq）到 dest，失败返回 None。"""
     for quality in THUMB_QUALITIES:
@@ -235,8 +269,9 @@ def build_upload_command(options: UploadBilibiliOptions) -> PreparedBilibiliUplo
     dtime = parse_dtime(options.dtime) if options.dtime else None
 
     # 标题自动包装：【中配】<正文><作者名>，例如 【中配】最弱的草系宝可梦是谁？WolfeyVGC
-    author = info.get("uploader") or info.get("channel") or ""
+    author = author_name(info)
     title = f"【中配】{title_input}{author}"
+    tag = options.tag if options.tag is not None else default_tags_for_author(author, options.author_tags_json)
 
     # 封面：优先用户指定，否则下载 YouTube 缩略图到任务目录
     cover_path = ""
@@ -262,7 +297,7 @@ def build_upload_command(options: UploadBilibiliOptions) -> PreparedBilibiliUplo
         "--copyright", str(COPYRIGHT_SELF),
         "--title", title,
         "--desc", desc,
-        "--tag", options.tag,
+        "--tag", tag,
         "--tid", str(options.tid),
     ]
     if cover_path:
@@ -277,7 +312,7 @@ def build_upload_command(options: UploadBilibiliOptions) -> PreparedBilibiliUplo
         cookie=cookie,
         title=title,
         desc=desc,
-        tag=options.tag,
+        tag=tag,
         tid=options.tid,
         cover_path=cover_path,
         dtime=dtime,
@@ -348,7 +383,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="把 workfolder 成片投稿到 B 站")
     parser.add_argument("path", help="任务目录，或 media/video_final_trimmed.mp4 路径")
     parser.add_argument("--title", required=True, help="B 站稿件标题（中文，必填）")
-    parser.add_argument("--tag", default=DEFAULT_TAGS, help=f"逗号分隔标签，默认 {DEFAULT_TAGS}")
+    parser.add_argument(
+        "--tag",
+        default=None,
+        help=(
+            "逗号分隔标签；不传时按作者从 DEFAULT_TAGS / "
+            f"{AUTHOR_TAGS_ENV} 匹配，未匹配则为空"
+        ),
+    )
     parser.add_argument("--tid", type=int, default=DEFAULT_TID, help=f"投稿分区，默认 {DEFAULT_TID}")
     parser.add_argument("--cover", help="自定义封面图路径（给了就不从 YouTube 下载）")
     parser.add_argument("--desc", help="自定义简介（给了就不按模板自动生成）")
@@ -368,6 +410,7 @@ def main() -> None:
         dtime=args.dtime,
         cookie=args.cookie,
         biliup=args.biliup,
+        author_tags_json=os.getenv(AUTHOR_TAGS_ENV, ""),
         dry_run=args.dry_run,
     )
 

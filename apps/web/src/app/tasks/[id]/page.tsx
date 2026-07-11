@@ -515,6 +515,8 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                 <dd>
                   {task.execution_mode === "manual" ? t.task.executionManual : t.task.executionAuto}
                 </dd>
+                <dt className="text-muted-foreground">{t.task.autoBilibiliUpload}</dt>
+                <dd>{task.auto_bilibili_upload ? t.task.enabled : t.task.disabled}</dd>
                 {task.session_path ? (
                   <>
                     <dt className="text-muted-foreground">{t.task.session}</dt>

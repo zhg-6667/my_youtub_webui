@@ -69,6 +69,7 @@ export default function Home() {
   const [localSubtitleFile, setLocalSubtitleFile] = useState<File | null>(null)
   const [localDirection, setLocalDirection] = useState<LocalDirection>("en-zh")
   const [executionMode, setExecutionMode] = useState<ExecutionMode>("auto")
+  const [autoBilibiliUpload, setAutoBilibiliUpload] = useState(false)
   const [tasks, setTasks] = useState<TaskSummary[]>([])
   const [error, setError] = useState("")
   const [submitting, setSubmitting] = useState(false)
@@ -116,12 +117,13 @@ export default function Home() {
     setSubmitting(true)
     try {
       const created = localFile
-        ? await uploadLocalTask(localFile, localDirection, localSubtitleFile, executionMode)
-        : await createTask(submittedUrl, executionMode)
+        ? await uploadLocalTask(localFile, localDirection, localSubtitleFile, executionMode, autoBilibiliUpload)
+        : await createTask(submittedUrl, executionMode, autoBilibiliUpload)
       setYoutubeUrl("")
       setBilibiliUrl("")
       setLocalFile(null)
       setLocalSubtitleFile(null)
+      setAutoBilibiliUpload(false)
       if (fileInputRef.current) {
         fileInputRef.current.value = ""
       }
@@ -231,6 +233,18 @@ export default function Home() {
                   </SelectContent>
                 </Select>
               </div>
+              <label className="flex items-start gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                <Input
+                  type="checkbox"
+                  checked={autoBilibiliUpload}
+                  onChange={(event) => setAutoBilibiliUpload(event.target.checked)}
+                  className="mt-0.5 size-4"
+                />
+                <span className="grid gap-1">
+                  <span className="font-medium">{t.home.autoBilibiliUpload}</span>
+                  <span className="text-xs text-muted-foreground">{t.home.autoBilibiliUploadHelp}</span>
+                </span>
+              </label>
               <div className="flex items-center justify-between gap-3">
                 {queued > 0 ? (
                   <p className="text-xs text-muted-foreground">

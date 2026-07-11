@@ -39,6 +39,23 @@ def _write_metadata(task_dir: Path) -> None:
     )
 
 
+def _write_metadata_with_author(task_dir: Path, author: str) -> None:
+    metadata = task_dir / "metadata"
+    metadata.mkdir(exist_ok=True)
+    (metadata / "ytdlp_info.json").write_text(
+        f"""
+        {{
+          "id": "abc123",
+          "title": "Original title",
+          "uploader": "{author}",
+          "upload_date": "20260117",
+          "webpage_url": "https://www.youtube.com/watch?v=abc123"
+        }}
+        """,
+        encoding="utf-8",
+    )
+
+
 def test_resolve_paths_prefers_trimmed_video_for_task_directory(tmp_path: Path) -> None:
     task_dir = _make_task_dir(tmp_path)
     preferred = task_dir / "media" / VIDEO_NAME
@@ -139,6 +156,66 @@ def test_build_upload_command_omits_dtime_for_immediate_publish(tmp_path: Path) 
     )
 
     assert "--dtime" not in prepared.command
+
+
+def test_build_upload_command_uses_configured_author_tags(tmp_path: Path) -> None:
+    task_dir = _make_task_dir(tmp_path)
+    (task_dir / "media" / VIDEO_NAME).write_bytes(b"video")
+    _write_metadata_with_author(task_dir, "WolfeyVGC")
+    cover = tmp_path / "cover.jpg"
+    cover.write_bytes(b"cover")
+
+    prepared = build_upload_command(
+        UploadBilibiliOptions(
+            path=str(task_dir),
+            title="标题",
+            cover=str(cover),
+            biliup="biliup",
+        )
+    )
+
+    assert prepared.tag == "狼叔,宝可梦,神奇宝贝,VGC,WolfeyVGC,对战游戏,Pokemon,口袋妖怪"
+    assert prepared.command[prepared.command.index("--tag") + 1] == prepared.tag
+
+
+def test_build_upload_command_uses_empty_tags_for_unconfigured_author(tmp_path: Path) -> None:
+    task_dir = _make_task_dir(tmp_path)
+    (task_dir / "media" / VIDEO_NAME).write_bytes(b"video")
+    _write_metadata_with_author(task_dir, "UnknownCreator")
+    cover = tmp_path / "cover.jpg"
+    cover.write_bytes(b"cover")
+
+    prepared = build_upload_command(
+        UploadBilibiliOptions(
+            path=str(task_dir),
+            title="标题",
+            cover=str(cover),
+            biliup="biliup",
+        )
+    )
+
+    assert prepared.tag == ""
+    assert prepared.command[prepared.command.index("--tag") + 1] == ""
+
+
+def test_build_upload_command_allows_author_tags_env_override(monkeypatch, tmp_path: Path) -> None:
+    task_dir = _make_task_dir(tmp_path)
+    (task_dir / "media" / VIDEO_NAME).write_bytes(b"video")
+    _write_metadata_with_author(task_dir, "UnknownCreator")
+    cover = tmp_path / "cover.jpg"
+    cover.write_bytes(b"cover")
+    monkeypatch.setenv("BILIBILI_AUTHOR_TAGS_JSON", '{"UnknownCreator":"自定义,标签"}')
+
+    prepared = build_upload_command(
+        UploadBilibiliOptions(
+            path=str(task_dir),
+            title="标题",
+            cover=str(cover),
+            biliup="biliup",
+        )
+    )
+
+    assert prepared.tag == "自定义,标签"
 
 
 def test_build_upload_command_requires_metadata(tmp_path: Path) -> None:

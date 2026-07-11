@@ -42,6 +42,7 @@ def mask_secret(value: str) -> str:
 class TaskCreate(BaseModel):
     url: str
     execution_mode: str = "auto"
+    auto_bilibili_upload: bool = False
 
 
 class ContinueTaskRequest(BaseModel):
@@ -86,6 +87,10 @@ class OpenAIModelsRequest(BaseModel):
 
 class YtdlpSettingsUpdate(BaseModel):
     proxy_port: str = ""
+
+
+class BilibiliSettingsUpdate(BaseModel):
+    author_tags_json: str = ""
 
 
 class MailSettingsUpdate(BaseModel):
@@ -212,6 +217,26 @@ def normalize_translate_concurrency(value: str) -> str:
     return concurrency
 
 
+def normalize_bilibili_author_tags_json(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    try:
+        parsed = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"Bilibili author tags must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=422, detail="Bilibili author tags must be a JSON object.")
+    normalized: dict[str, str] = {}
+    for author, tags in parsed.items():
+        if not isinstance(author, str) or not isinstance(tags, str):
+            raise HTTPException(status_code=422, detail="Bilibili author tags keys and values must be strings.")
+        key = author.strip()
+        if key:
+            normalized[key] = tags.strip()
+    return _json.dumps(normalized, ensure_ascii=False)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_runtime_dirs()
@@ -269,6 +294,7 @@ def _task_with_source(task: dict | None) -> dict | None:
     if not task:
         return None
     result = dict(task)
+    result["auto_bilibili_upload"] = bool(result.get("auto_bilibili_upload"))
     try:
         result["source_name"] = detect_source(result["url"]).name
     except ValueError:
@@ -311,6 +337,7 @@ def create_task(payload: TaskCreate) -> dict:
         payload.url.strip(),
         task_id=video_id,
         execution_mode=normalize_execution_mode(payload.execution_mode),
+        auto_bilibili_upload=payload.auto_bilibili_upload,
     )
     worker.enqueue(task_id)
     return _task_with_source(database.get_task(task_id))
@@ -372,6 +399,7 @@ def upload_local_video(
     file: UploadFile = File(...),
     subtitle_file: UploadFile | None = File(None),
     execution_mode: str = Form("auto"),
+    auto_bilibili_upload: bool = Form(False),
 ) -> dict:
     if direction not in LOCAL_UPLOAD_DIRECTIONS:
         raise HTTPException(status_code=422, detail="Unsupported local video direction.")
@@ -406,6 +434,7 @@ def upload_local_video(
         url,
         task_id=task_id,
         execution_mode=normalize_execution_mode(execution_mode),
+        auto_bilibili_upload=auto_bilibili_upload,
     )
     database.update_task(task_id, title=Path(original_name).stem)
     worker.enqueue(task_id)
@@ -475,8 +504,14 @@ def rerun_task(task_id: str) -> dict:
     _ensure_runtime_ready()
     url = task["url"]
     execution_mode = task.get("execution_mode") or database.DEFAULT_EXECUTION_MODE
+    auto_bilibili_upload = bool(task.get("auto_bilibili_upload"))
     _purge_task(task)
-    new_id = database.create_task(url, task_id=task_id, execution_mode=execution_mode)
+    new_id = database.create_task(
+        url,
+        task_id=task_id,
+        execution_mode=execution_mode,
+        auto_bilibili_upload=auto_bilibili_upload,
+    )
     worker.enqueue(new_id)
     return _task_with_source(database.get_task(new_id))
 
@@ -817,6 +852,17 @@ def get_ytdlp_settings() -> dict:
 def save_ytdlp_settings(payload: YtdlpSettingsUpdate) -> dict:
     database.save_ytdlp_settings(normalize_proxy_port(payload.proxy_port))
     return get_ytdlp_settings()
+
+
+@app.get("/api/settings/bilibili")
+def get_bilibili_settings() -> dict:
+    return database.get_bilibili_settings()
+
+
+@app.post("/api/settings/bilibili")
+def save_bilibili_settings(payload: BilibiliSettingsUpdate) -> dict:
+    database.save_bilibili_settings(normalize_bilibili_author_tags_json(payload.author_tags_json))
+    return get_bilibili_settings()
 
 
 @app.get("/api/settings/mail")

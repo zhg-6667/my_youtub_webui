@@ -146,6 +146,26 @@ def test_task_id_is_video_id_and_dedupes_existing(monkeypatch, tmp_path):
     assert enqueued == ["abcdefghijk"]
 
 
+def test_create_task_can_enable_auto_bilibili_upload(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda task_id: enqueued.append(task_id))
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/tasks",
+        json={
+            "url": "https://www.youtube.com/watch?v=autobilipub",
+            "auto_bilibili_upload": True,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["auto_bilibili_upload"] is True
+    assert database.get_task("autobilipub")["auto_bilibili_upload"] == 1
+    assert enqueued == ["autobilipub"]
+
+
 def test_different_videos_create_separate_tasks(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     enqueued: list[str] = []
@@ -769,6 +789,34 @@ def test_ytdlp_proxy_port_rejects_invalid_value(monkeypatch, tmp_path):
     client = TestClient(main.app)
 
     response = client.post("/api/settings/ytdlp", json={"proxy_port": "70000"})
+
+    assert response.status_code == 422
+
+
+def test_bilibili_settings_save_author_tags_json(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    saved = client.post(
+        "/api/settings/bilibili",
+        json={"author_tags_json": '{"WolfeyVGC":"狼叔,宝可梦,VGC"}'},
+    )
+    loaded = client.get("/api/settings/bilibili")
+
+    assert saved.status_code == 200
+    assert saved.json()["author_tags_json"] == '{"WolfeyVGC": "狼叔,宝可梦,VGC"}'
+    assert loaded.status_code == 200
+    assert loaded.json() == saved.json()
+
+
+def test_bilibili_settings_rejects_invalid_author_tags_json(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/settings/bilibili",
+        json={"author_tags_json": '["not", "an", "object"]'},
+    )
 
     assert response.status_code == 422
 

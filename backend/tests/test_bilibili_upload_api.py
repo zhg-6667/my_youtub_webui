@@ -136,9 +136,11 @@ def test_bilibili_upload_worker_marks_success(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     task_id = _make_succeeded_task(tmp_path)
     job_id = database.create_bilibili_upload_job(task_id, title="标题", publish_mode="now")
+    database.save_bilibili_settings('{"WolfeyVGC":"狼叔,宝可梦,VGC"}')
 
     def fake_upload(options):
         assert options.title == "标题"
+        assert options.author_tags_json == '{"WolfeyVGC":"狼叔,宝可梦,VGC"}'
         return FakeUploadResult()
 
     import scripts.upload_bilibili as upload_script

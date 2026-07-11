@@ -43,7 +43,8 @@ def init_db() -> None:
               created_at TEXT NOT NULL,
               started_at TEXT,
               completed_at TEXT,
-              execution_mode TEXT NOT NULL DEFAULT 'auto'
+              execution_mode TEXT NOT NULL DEFAULT 'auto',
+              auto_bilibili_upload INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS task_stages (
@@ -125,6 +126,8 @@ def init_db() -> None:
             )
         if "cut_intervals_json" not in task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN cut_intervals_json TEXT")
+        if "auto_bilibili_upload" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN auto_bilibili_upload INTEGER NOT NULL DEFAULT 0")
         stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_stages)").fetchall()}
         if "progress" not in stage_columns:
             conn.execute("ALTER TABLE task_stages ADD COLUMN progress INTEGER")
@@ -187,6 +190,7 @@ def create_task(
     task_id: str | None = None,
     *,
     execution_mode: str = DEFAULT_EXECUTION_MODE,
+    auto_bilibili_upload: bool = False,
 ) -> str:
     new_id = task_id or str(uuid.uuid4())
     created_at = now_iso()
@@ -194,10 +198,10 @@ def create_task(
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO tasks (id, url, status, current_stage, created_at, execution_mode)
-            VALUES (?, ?, 'queued', ?, ?, ?)
+            INSERT INTO tasks (id, url, status, current_stage, created_at, execution_mode, auto_bilibili_upload)
+            VALUES (?, ?, 'queued', ?, ?, ?, ?)
             """,
-            (new_id, url, STAGES[0].name, created_at, mode),
+            (new_id, url, STAGES[0].name, created_at, mode, 1 if auto_bilibili_upload else 0),
         )
         conn.executemany(
             """
@@ -238,7 +242,7 @@ def list_tasks(limit: int = 100) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, url, title, status, current_stage, final_video_path, error_message, "
-            "created_at, started_at, completed_at, execution_mode FROM tasks "
+            "created_at, started_at, completed_at, execution_mode, auto_bilibili_upload FROM tasks "
             "ORDER BY created_at DESC, rowid DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -446,6 +450,16 @@ def get_ytdlp_settings() -> dict[str, str]:
 
 def save_ytdlp_settings(proxy_port: str) -> None:
     set_setting("ytdlp.proxy_port", proxy_port.strip())
+
+
+def get_bilibili_settings() -> dict[str, str]:
+    return {
+        "author_tags_json": get_setting("bilibili.author_tags_json", ""),
+    }
+
+
+def save_bilibili_settings(author_tags_json: str) -> None:
+    set_setting("bilibili.author_tags_json", author_tags_json.strip())
 
 
 def get_mail_settings() -> dict[str, str]:

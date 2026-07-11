@@ -5,7 +5,7 @@ import sys
 import types
 from pathlib import Path
 
-from backend.app import database
+from backend.app import bilibili_uploads, database
 from backend.app import pipeline
 from backend.app.pipeline import PipelineRunner
 
@@ -59,6 +59,37 @@ def test_pipeline_marks_all_stages_succeeded(monkeypatch, tmp_path):
     assert task["final_video_path"] == str(final_path)
     assert [stage["status"] for stage in task["stages"]] == ["succeeded"] * 10
     assert [stage["progress"] for stage in task["stages"]] == [100] * 10
+
+
+def test_pipeline_auto_queues_bilibili_upload_on_success(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=autobilique",
+        task_id="autobilique",
+        auto_bilibili_upload=True,
+    )
+    final_path = tmp_path / "video_final.mp4"
+    final_path.write_bytes(b"mp4")
+    enqueued: list[str] = []
+    monkeypatch.setattr(bilibili_uploads, "enqueue", lambda job_id: enqueued.append(job_id))
+
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
+        monkeypatch.setattr(PipelineRunner, name, _noop_stage)
+
+    def merge_video(self, task):
+        database.update_task(task_id, title="自动发布标题")
+        self.artifacts.final_video = final_path
+
+    monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+
+    PipelineRunner(task_id).run()
+
+    assert len(enqueued) == 1
+    job = database.get_bilibili_upload_job(enqueued[0])
+    assert job["task_id"] == task_id
+    assert job["title"] == "自动发布标题"
+    assert job["publish_mode"] == "now"
+    assert job["status"] == "queued"
 
 
 def test_pipeline_skips_already_succeeded_stages(monkeypatch, tmp_path):
