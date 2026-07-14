@@ -146,6 +146,49 @@ def test_task_id_is_video_id_and_dedupes_existing(monkeypatch, tmp_path):
     assert enqueued == ["abcdefghijk"]
 
 
+def test_video_link_records_can_be_saved_listed_and_deleted(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    saved = client.post("/api/video-links", json={"url": "https://www.youtube.com/watch?v=savedlink01"})
+    duplicated = client.post("/api/video-links", json={"url": "https://youtu.be/savedlink01"})
+    listed = client.get("/api/video-links")
+
+    assert saved.status_code == 201
+    assert duplicated.status_code == 201
+    assert saved.json()["id"] == "savedlink01"
+    assert duplicated.json()["id"] == "savedlink01"
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["video_links"]] == ["savedlink01"]
+    assert listed.json()["video_links"][0]["url"] == "https://youtu.be/savedlink01"
+
+    deleted = client.delete("/api/video-links/savedlink01")
+    assert deleted.status_code == 204
+    assert client.get("/api/video-links").json()["video_links"] == []
+
+
+def test_video_link_record_tracks_created_task(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(main.worker, "enqueue", lambda task_id: None)
+    client = TestClient(main.app)
+
+    saved = client.post("/api/video-links", json={"url": "https://www.youtube.com/watch?v=tracktask01"})
+    created = client.post("/api/tasks", json={"url": saved.json()["url"]})
+    listed = client.get("/api/video-links")
+
+    assert created.status_code == 201
+    assert listed.json()["video_links"][0]["last_task_id"] == created.json()["id"]
+
+
+def test_video_link_record_rejects_unsupported_url(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    response = client.post("/api/video-links", json={"url": "https://example.com/video"})
+
+    assert response.status_code == 422
+
+
 def test_create_task_can_enable_auto_bilibili_upload(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     enqueued: list[str] = []

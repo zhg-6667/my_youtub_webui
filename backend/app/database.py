@@ -100,6 +100,15 @@ def init_db() -> None:
               completed_at TEXT,
               FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS video_link_records (
+              id TEXT PRIMARY KEY,
+              url TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              last_task_id TEXT,
+              FOREIGN KEY (last_task_id) REFERENCES tasks(id) ON DELETE SET NULL
+            );
             """
         )
         defaults = openai_defaults()
@@ -369,6 +378,49 @@ def update_task(task_id: str, **fields: Any) -> None:
     values = list(fields.values()) + [task_id]
     with connect() as conn:
         conn.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", values)
+
+
+def upsert_video_link_record(url: str, record_id: str | None = None) -> dict[str, Any]:
+    new_id = record_id or str(uuid.uuid4())
+    updated_at = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO video_link_records (id, url, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at
+            """,
+            (new_id, url, updated_at, updated_at),
+        )
+        row = conn.execute("SELECT * FROM video_link_records WHERE id = ?", (new_id,)).fetchone()
+    return dict(row)
+
+
+def list_video_link_records(limit: int = 100) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, url, created_at, updated_at, last_task_id
+            FROM video_link_records
+            ORDER BY updated_at DESC, rowid DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_video_link_record(record_id: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute("DELETE FROM video_link_records WHERE id = ?", (record_id,))
+        return cursor.rowcount > 0
+
+
+def mark_video_link_record_task(record_id: str, task_id: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE video_link_records SET last_task_id = ?, updated_at = ? WHERE id = ?",
+            (task_id, now_iso(), record_id),
+        )
 
 
 def get_task_cut_intervals(task_id: str) -> str | None:

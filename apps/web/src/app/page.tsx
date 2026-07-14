@@ -1,15 +1,19 @@
 "use client"
 
 import Link from "next/link"
-import { useRouter } from "next/navigation"
-import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react"
-import { ChevronRight, Play, Upload } from "lucide-react"
+import { useRouter, useSearchParams } from "next/navigation"
+import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useRef, useState } from "react"
+import { ChevronRight, Link2, Play, Plus, Trash2, Upload } from "lucide-react"
 
 import {
   ExecutionMode,
   LocalDirection,
   TaskSummary,
+  VideoLinkRecord,
   createTask,
+  createVideoLink,
+  deleteVideoLink,
+  listVideoLinks,
   listTasks,
   uploadLocalTask,
 } from "@/lib/api"
@@ -58,26 +62,65 @@ function activeCount(tasks: TaskSummary[]) {
   return tasks.filter((t) => isActive(t.status)).length
 }
 
-export default function Home() {
+function createUrlFields(url: string) {
+  if (!url) return { youtube: "", bilibili: "" }
+  if (/bilibili\.com/i.test(url)) return { youtube: "", bilibili: url }
+  return { youtube: url, bilibili: "" }
+}
+
+function HomeContent() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const { activeTasksText, stageLabel, statusLabel, t } = useI18n()
+  const initialUrlFields = createUrlFields((searchParams.get("url") || "").trim())
   const fileInputRef = useRef<HTMLInputElement>(null)
   const subtitleInputRef = useRef<HTMLInputElement>(null)
-  const [youtubeUrl, setYoutubeUrl] = useState("")
-  const [bilibiliUrl, setBilibiliUrl] = useState("")
+  const createFormRef = useRef<HTMLFormElement>(null)
+  const [youtubeUrl, setYoutubeUrl] = useState(initialUrlFields.youtube)
+  const [bilibiliUrl, setBilibiliUrl] = useState(initialUrlFields.bilibili)
+  const [recordUrl, setRecordUrl] = useState("")
   const [localFile, setLocalFile] = useState<File | null>(null)
   const [localSubtitleFile, setLocalSubtitleFile] = useState<File | null>(null)
   const [localDirection, setLocalDirection] = useState<LocalDirection>("en-zh")
   const [executionMode, setExecutionMode] = useState<ExecutionMode>("auto")
   const [autoBilibiliUpload, setAutoBilibiliUpload] = useState(false)
   const [tasks, setTasks] = useState<TaskSummary[]>([])
+  const [videoLinks, setVideoLinks] = useState<VideoLinkRecord[]>([])
   const [error, setError] = useState("")
+  const [recordError, setRecordError] = useState("")
   const [submitting, setSubmitting] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const [deletingRecordId, setDeletingRecordId] = useState<string | null>(null)
 
   async function refreshTasks() {
     const { tasks: list } = await listTasks()
     setTasks(list)
   }
+
+  async function refreshVideoLinks() {
+    const { video_links: list } = await listVideoLinks()
+    setVideoLinks(list)
+  }
+
+  const fillCreateUrl = useCallback((url: string) => {
+    setError("")
+    setLocalFile(null)
+    setLocalSubtitleFile(null)
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ""
+    }
+    if (subtitleInputRef.current) {
+      subtitleInputRef.current.value = ""
+    }
+    if (/bilibili\.com/i.test(url)) {
+      setBilibiliUrl(url)
+      setYoutubeUrl("")
+    } else {
+      setYoutubeUrl(url)
+      setBilibiliUrl("")
+    }
+    window.setTimeout(() => createFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0)
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -98,6 +141,24 @@ export default function Home() {
       window.clearInterval(interval)
     }
   }, [t.home.loadError])
+
+  useEffect(() => {
+    let cancelled = false
+
+    const loadVideoLinks = async () => {
+      try {
+        const { video_links: list } = await listVideoLinks()
+        if (!cancelled) setVideoLinks(list)
+      } catch (err) {
+        if (!cancelled) setRecordError(err instanceof Error ? err.message : t.home.videoLinkLoadError)
+      }
+    }
+
+    loadVideoLinks()
+    return () => {
+      cancelled = true
+    }
+  }, [t.home.videoLinkLoadError])
 
   function selectLocalFile(event: ChangeEvent<HTMLInputElement>) {
     setError("")
@@ -139,6 +200,41 @@ export default function Home() {
     }
   }
 
+  async function submitVideoLinkRecord(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const url = recordUrl.trim()
+    if (!url) return
+    setRecording(true)
+    setRecordError("")
+    try {
+      await createVideoLink(url)
+      setRecordUrl("")
+      await refreshVideoLinks()
+    } catch (err) {
+      setRecordError(err instanceof Error ? err.message : t.home.videoLinkCreateError)
+    } finally {
+      setRecording(false)
+    }
+  }
+
+  async function removeVideoLinkRecord(recordId: string) {
+    setDeletingRecordId(recordId)
+    setRecordError("")
+    try {
+      await deleteVideoLink(recordId)
+      await refreshVideoLinks()
+    } catch (err) {
+      setRecordError(err instanceof Error ? err.message : t.home.videoLinkDeleteError)
+    } finally {
+      setDeletingRecordId(null)
+    }
+  }
+
+  function createFromVideoLink(url: string) {
+    fillCreateUrl(url)
+    router.push(`/?url=${encodeURIComponent(url)}`)
+  }
+
   const queued = activeCount(tasks)
   const hasUrl = Boolean(youtubeUrl.trim() || bilibiliUrl.trim())
   const hasLocalFile = Boolean(localFile)
@@ -154,7 +250,7 @@ export default function Home() {
             <CardTitle>{t.home.createTitle}</CardTitle>
           </CardHeader>
           <CardContent>
-            <form onSubmit={submitTask} className="space-y-4">
+            <form ref={createFormRef} onSubmit={submitTask} className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="youtube-url">{t.home.youtubeLabel}</Label>
                 <Input
@@ -270,6 +366,76 @@ export default function Home() {
 
         <Card>
           <CardHeader>
+            <CardTitle>{t.home.videoLinkRecords} ({videoLinks.length})</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={submitVideoLinkRecord} className="flex flex-col gap-3 sm:flex-row">
+              <div className="min-w-0 flex-1 space-y-2">
+                <Label htmlFor="record-url">{t.home.videoLinkLabel}</Label>
+                <Input
+                  id="record-url"
+                  value={recordUrl}
+                  onChange={(event) => setRecordUrl(event.target.value)}
+                  placeholder="https://www.youtube.com/watch?v=..."
+                />
+              </div>
+              <Button type="submit" className="self-end" disabled={!recordUrl.trim() || recording}>
+                <Plus className="size-4" />
+                {recording ? t.home.videoLinkRecording : t.home.videoLinkRecord}
+              </Button>
+            </form>
+
+            {recordError ? (
+              <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {recordError}
+              </div>
+            ) : null}
+
+            {videoLinks.length === 0 ? (
+              <div className="mt-4 rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">
+                {t.home.videoLinkEmpty}
+              </div>
+            ) : (
+              <ScrollArea className="mt-4 max-h-80">
+                <ul className="flex flex-col divide-y divide-border/60">
+                  {videoLinks.map((item) => (
+                    <li key={item.id} className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-zinc-900">{shortUrl(item.url)}</p>
+                        <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                          <Badge className="border-sky-200 bg-sky-50 text-sky-700">
+                            {item.source_name === "bilibili" ? "Bilibili" : "YouTube"}
+                          </Badge>
+                          <span>{formatTime(item.updated_at)}</span>
+                          {item.last_task_id ? <span>· {t.home.videoLinkTaskCreated}</span> : null}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <Button type="button" size="sm" onClick={() => createFromVideoLink(item.url)}>
+                          <Link2 className="size-4" />
+                          {t.home.videoLinkCreateTask}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={t.home.videoLinkDelete}
+                          disabled={deletingRecordId === item.id}
+                          onClick={() => removeVideoLinkRecord(item.id)}
+                        >
+                          <Trash2 className="size-4" />
+                        </Button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </ScrollArea>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
             <CardTitle>{t.home.taskHistory} ({tasks.length})</CardTitle>
           </CardHeader>
           <CardContent className="px-0">
@@ -312,5 +478,13 @@ export default function Home() {
         </Card>
       </div>
     </main>
+  )
+}
+
+export default function Home() {
+  return (
+    <Suspense fallback={null}>
+      <HomeContent />
+    </Suspense>
   )
 }

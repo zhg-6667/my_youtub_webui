@@ -16,6 +16,15 @@ export type BilibiliUploadStatus = "queued" | "running" | "succeeded" | "failed"
 export type WatermarkMaskMode = "patch" | "blur"
 export type WatermarkMaskStatus = "queued" | "running" | "succeeded" | "failed"
 
+export type VideoLinkRecord = {
+  id: string
+  url: string
+  created_at: string
+  updated_at: string
+  last_task_id: string | null
+  source_name?: string
+}
+
 export type TaskStage = {
   task_id: string
   name: string
@@ -171,6 +180,21 @@ export async function getTaskLog(taskId: string): Promise<string> {
 
 export function listTasks(limit = 100) {
   return request<{ tasks: TaskSummary[] }>(`/api/tasks?limit=${limit}`)
+}
+
+export function listVideoLinks(limit = 100) {
+  return request<{ video_links: VideoLinkRecord[] }>(`/api/video-links?limit=${limit}`)
+}
+
+export function createVideoLink(url: string) {
+  return request<VideoLinkRecord>("/api/video-links", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  })
+}
+
+export function deleteVideoLink(recordId: string) {
+  return request<void>(`/api/video-links/${recordId}`, { method: "DELETE" })
 }
 
 export function getTask(taskId: string) {

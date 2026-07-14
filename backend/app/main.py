@@ -47,6 +47,10 @@ class TaskCreate(BaseModel):
     auto_bilibili_upload: bool = False
 
 
+class VideoLinkRecordCreate(BaseModel):
+    url: str
+
+
 class ContinueTaskRequest(BaseModel):
     execution_mode: str | None = None
 
@@ -304,6 +308,15 @@ def _task_with_source(task: dict | None) -> dict | None:
     return result
 
 
+def _video_link_record_with_source(record: dict) -> dict:
+    result = dict(record)
+    try:
+        result["source_name"] = detect_source(result["url"]).name
+    except ValueError:
+        result["source_name"] = "unknown"
+    return result
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -323,24 +336,57 @@ def normalize_execution_mode(value: str) -> str:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@app.post("/api/tasks", status_code=201)
-def create_task(payload: TaskCreate) -> dict:
+def normalize_video_link_url(url: str) -> tuple[str, str]:
+    cleaned = url.strip()
+    if not cleaned:
+        raise HTTPException(status_code=422, detail="Video URL is required.")
     try:
-        video_id = extract_video_id(payload.url)
+        video_id = extract_video_id(cleaned)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return cleaned, video_id
+
+
+@app.get("/api/video-links")
+def list_video_link_records(limit: int = 100) -> dict:
+    return {
+        "video_links": [
+            _video_link_record_with_source(record)
+            for record in database.list_video_link_records(limit=limit)
+        ]
+    }
+
+
+@app.post("/api/video-links", status_code=201)
+def create_video_link_record(payload: VideoLinkRecordCreate) -> dict:
+    url, video_id = normalize_video_link_url(payload.url)
+    return _video_link_record_with_source(database.upsert_video_link_record(url, record_id=video_id))
+
+
+@app.delete("/api/video-links/{record_id}", status_code=204)
+def delete_video_link_record(record_id: str) -> Response:
+    if not database.delete_video_link_record(record_id):
+        raise HTTPException(status_code=404, detail="Video link record not found.")
+    return Response(status_code=204)
+
+
+@app.post("/api/tasks", status_code=201)
+def create_task(payload: TaskCreate) -> dict:
+    url, video_id = normalize_video_link_url(payload.url)
 
     existing_id = database.find_task_by_video_id(video_id)
     if existing_id:
+        database.mark_video_link_record_task(video_id, existing_id)
         return _task_with_source(database.get_task(existing_id))
 
     _ensure_runtime_ready()
     task_id = database.create_task(
-        payload.url.strip(),
+        url,
         task_id=video_id,
         execution_mode=normalize_execution_mode(payload.execution_mode),
         auto_bilibili_upload=payload.auto_bilibili_upload,
     )
+    database.mark_video_link_record_task(video_id, task_id)
     worker.enqueue(task_id)
     return _task_with_source(database.get_task(task_id))
 

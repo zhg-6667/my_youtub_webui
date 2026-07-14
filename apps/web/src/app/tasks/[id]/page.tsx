@@ -379,7 +379,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const isBilibiliTask = task?.source_name === "bilibili"
   const canRedoStage = isManual && !isRunning && !isQueued
   const canTrim = !isRunning && !isQueued
-  const canEditTrimIntervals = Boolean(task) && !(task.status === "running" && task.current_stage === "trim_video")
+  const canEditTrimIntervals = Boolean(task) && !(task?.status === "running" && task.current_stage === "trim_video")
   const redoConfirmStageInfo = task?.stages.find((stage) => stage.name === redoConfirmStage)
 
   useEffect(() => {
