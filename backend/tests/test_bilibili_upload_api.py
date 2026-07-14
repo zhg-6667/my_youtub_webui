@@ -57,7 +57,29 @@ def test_create_bilibili_upload_job(monkeypatch, tmp_path):
     assert body["task_id"] == task_id
     assert body["title"] == "测试标题"
     assert body["publish_mode"] == "now"
+    assert body["cover_path"] is None
     assert body["status"] == "queued"
+    assert enqueued == [body["id"]]
+
+
+def test_create_bilibili_upload_job_with_cover(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.bilibili_uploads, "enqueue", enqueued.append)
+    task_id = _make_succeeded_task(tmp_path)
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/bilibili-upload",
+        data={"title": "测试标题", "publish_mode": "now"},
+        files={"cover_file": ("cover.png", b"cover image", "image/png")},
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["task_id"] == task_id
+    assert body["cover_path"].endswith(".png")
+    assert Path(body["cover_path"]).read_bytes() == b"cover image"
     assert enqueued == [body["id"]]
 
 
@@ -153,6 +175,31 @@ def test_bilibili_upload_worker_marks_success(monkeypatch, tmp_path):
     assert job["status"] == "succeeded"
     assert job["return_code"] == 0
     assert Path(job["log_path"]).read_text(encoding="utf-8") == "uploaded\n"
+
+
+def test_bilibili_upload_worker_passes_cover(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = _make_succeeded_task(tmp_path)
+    cover = tmp_path / "cover.jpg"
+    cover.write_bytes(b"cover")
+    job_id = database.create_bilibili_upload_job(
+        task_id,
+        title="标题",
+        publish_mode="now",
+        cover_path=str(cover),
+    )
+
+    def fake_upload(options):
+        assert options.cover == str(cover)
+        return FakeUploadResult()
+
+    import scripts.upload_bilibili as upload_script
+
+    monkeypatch.setattr(upload_script, "upload_bilibili", fake_upload)
+
+    bilibili_uploads._run_job(job_id)
+
+    assert database.get_bilibili_upload_job(job_id)["status"] == "succeeded"
 
 
 def test_bilibili_upload_worker_marks_failure(monkeypatch, tmp_path):

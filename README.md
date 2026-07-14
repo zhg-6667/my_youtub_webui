@@ -219,6 +219,7 @@ cp env.txt.example .env
 | `OPENAI_TRANSLATE_CONCURRENCY` | 翻译阶段的并发请求数，默认 `50`。 |
 | `LOCAL_UPLOAD_MAX_BYTES` | 本地视频上传大小上限，默认 4 GiB。 |
 | `LOCAL_SUBTITLE_MAX_BYTES` | 可选本地 SRT 字幕上传大小上限，默认 20 MiB。 |
+| `BILIBILI_COVER_MAX_BYTES` | B 站投稿自定义封面上传大小上限，默认 20 MiB。 |
 | `YTDLP_PROXY_PORT` | yt-dlp 使用的本机代理端口，例如 `7890`。 |
 | `MAIL_ENABLED` | 是否启用任务完成/失败邮件通知，默认 `false`；也可在设置弹窗中维护。 |
 | `MAIL_SMTP_HOST` / `MAIL_SMTP_PORT` | SMTP 服务器地址和端口，默认端口 `587`。 |

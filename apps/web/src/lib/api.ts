@@ -52,6 +52,7 @@ export type BilibiliUploadJob = {
   title: string
   publish_mode: BilibiliPublishMode
   dtime: string | null
+  cover_path: string | null
   status: BilibiliUploadStatus
   log_path: string | null
   error_message: string | null
@@ -337,11 +338,28 @@ export function trimVideo(taskId: string, cutIntervals?: CutInterval[]) {
 
 export function createBilibiliUploadJob(
   taskId: string,
-  payload: { title: string; publish_mode: BilibiliPublishMode; dtime?: string | null },
+  payload: { title: string; publish_mode: BilibiliPublishMode; dtime?: string | null; cover_file?: File | null },
 ) {
-  return request<BilibiliUploadJob>(`/api/tasks/${taskId}/bilibili-upload`, {
+  const form = new FormData()
+  form.append("title", payload.title)
+  form.append("publish_mode", payload.publish_mode)
+  if (payload.dtime) {
+    form.append("dtime", payload.dtime)
+  }
+  if (payload.cover_file) {
+    form.append("cover_file", payload.cover_file)
+  }
+
+  return fetch(`${API_BASE}/api/tasks/${taskId}/bilibili-upload`, {
     method: "POST",
-    body: JSON.stringify(payload),
+    body: form,
+    cache: "no-store",
+  }).then(async (response) => {
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(body.detail || `Request failed: ${response.status}`)
+    }
+    return response.json() as Promise<BilibiliUploadJob>
   })
 }
 

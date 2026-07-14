@@ -7,6 +7,7 @@ import {
   Circle,
   Download,
   FileText,
+  ImageIcon,
   Loader2,
   Plus,
   Play,
@@ -171,6 +172,8 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [trimRanges, setTrimRanges] = useState<TrimRangeInput[]>([emptyTrimRange()])
   const [bilibiliOpen, setBilibiliOpen] = useState(false)
   const [bilibiliTitle, setBilibiliTitle] = useState("")
+  const [bilibiliCoverFile, setBilibiliCoverFile] = useState<File | null>(null)
+  const [bilibiliCoverInputKey, setBilibiliCoverInputKey] = useState(0)
   const [bilibiliPublishMode, setBilibiliPublishMode] = useState<BilibiliPublishMode>("now")
   const [bilibiliDtime, setBilibiliDtime] = useState("")
   const [creatingBilibiliJob, setCreatingBilibiliJob] = useState(false)
@@ -337,8 +340,11 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
         title,
         publish_mode: bilibiliPublishMode,
         dtime: bilibiliPublishMode === "scheduled" ? bilibiliDtime : null,
+        cover_file: bilibiliCoverFile,
       })
       setBilibiliJob(job)
+      setBilibiliCoverFile(null)
+      setBilibiliCoverInputKey((current) => current + 1)
       setBilibiliOpen(false)
     } catch (err) {
       setBilibiliError(err instanceof Error ? err.message : t.task.bilibiliUploadError)
@@ -574,6 +580,38 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                           disabled={creatingBilibiliJob}
                         />
                         <p className="text-xs text-muted-foreground">{t.task.bilibiliTitleHelp}</p>
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="bilibili-cover">{t.task.bilibiliCoverLabel}</Label>
+                        <Input
+                          key={bilibiliCoverInputKey}
+                          id="bilibili-cover"
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp"
+                          onChange={(event) => setBilibiliCoverFile(event.target.files?.[0] ?? null)}
+                          disabled={creatingBilibiliJob}
+                          className="h-10"
+                        />
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="min-w-0 flex-1 text-xs text-muted-foreground">
+                            {bilibiliCoverFile ? bilibiliCoverFile.name : t.task.bilibiliCoverHelp}
+                          </p>
+                          {bilibiliCoverFile ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                setBilibiliCoverFile(null)
+                                setBilibiliCoverInputKey((current) => current + 1)
+                              }}
+                              disabled={creatingBilibiliJob}
+                            >
+                              <ImageIcon className="size-3" />
+                              {t.task.bilibiliCoverClear}
+                            </Button>
+                          ) : null}
+                        </div>
                       </div>
                       <div className="space-y-2">
                         <Label htmlFor="bilibili-publish-mode">{t.task.bilibiliPublishMode}</Label>

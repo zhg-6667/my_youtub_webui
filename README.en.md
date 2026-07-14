@@ -219,6 +219,7 @@ Common environment variables:
 | `OPENAI_TRANSLATE_CONCURRENCY` | Parallel requests during translation. Default: `50`. |
 | `LOCAL_UPLOAD_MAX_BYTES` | Maximum local video upload size. Default: 4 GiB. |
 | `LOCAL_SUBTITLE_MAX_BYTES` | Maximum optional local SRT subtitle upload size. Default: 20 MiB. |
+| `BILIBILI_COVER_MAX_BYTES` | Maximum custom Bilibili cover upload size. Default: 20 MiB. |
 | `YTDLP_PROXY_PORT` | Local proxy port used by yt-dlp, for example `7890`. |
 | `MAIL_ENABLED` | Enable task success/failure email notifications. Default: `false`; can also be maintained from Settings. |
 | `MAIL_SMTP_HOST` / `MAIL_SMTP_PORT` | SMTP server host and port. Default port: `587`. |

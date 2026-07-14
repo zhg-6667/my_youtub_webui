@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import librosa
@@ -15,6 +16,10 @@ BASE_FACTOR_SAFETY = 0.99
 LOCAL_FACTOR_MIN = 0.9
 LOCAL_FACTOR_MAX = 1.1
 SPEED_NOOP_EPSILON = 1e-2
+SILENCE_THRESHOLD_DB = -45.0
+EDGE_SILENCE_KEEP_MS = 50
+INNER_SILENCE_MIN_MS = 250
+INNER_SILENCE_KEEP_MS = 160
 
 
 def split_audio_by_translation(vocals_file: Path, translation_file: Path, session: Path) -> Path:
@@ -37,6 +42,68 @@ def split_audio_by_translation(vocals_file: Path, translation_file: Path, sessio
 def _audio_duration(file: Path) -> tuple[float, int]:
     info = sf.info(str(file))
     return info.frames / info.samplerate, info.samplerate
+
+
+def _silence_threshold(audio: np.ndarray) -> float:
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    absolute = 10 ** (SILENCE_THRESHOLD_DB / 20)
+    relative = peak * 10 ** (-35 / 20)
+    return max(absolute, relative)
+
+
+def _mono_envelope(audio: np.ndarray) -> np.ndarray:
+    if audio.ndim == 1:
+        return np.abs(audio)
+    return np.max(np.abs(audio), axis=1)
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    if mask.size == 0:
+        return []
+    padded = np.concatenate(([False], mask, [False]))
+    changes = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(int(changes[i]), int(changes[i + 1])) for i in range(0, len(changes), 2)]
+
+
+def _trim_tts_file(source: Path, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / source.name
+    if output.exists() and output.stat().st_mtime >= source.stat().st_mtime:
+        return output
+
+    audio, sample_rate = sf.read(str(source), dtype="float32", always_2d=False)
+    if audio.size == 0:
+        shutil.copyfile(source, output)
+        return output
+
+    envelope = _mono_envelope(audio)
+    threshold = _silence_threshold(envelope)
+    voiced = envelope > threshold
+    if not np.any(voiced):
+        shutil.copyfile(source, output)
+        return output
+
+    keep_edge = int(sample_rate * EDGE_SILENCE_KEEP_MS / 1000)
+    start = max(0, int(np.argmax(voiced)) - keep_edge)
+    end = min(len(envelope), int(len(voiced) - np.argmax(voiced[::-1])) + keep_edge)
+    trimmed = audio[start:end]
+    trimmed_envelope = envelope[start:end]
+
+    min_inner = int(sample_rate * INNER_SILENCE_MIN_MS / 1000)
+    keep_inner = int(sample_rate * INNER_SILENCE_KEEP_MS / 1000)
+    keep_mask = np.ones(len(trimmed_envelope), dtype=bool)
+    for run_start, run_end in _runs(trimmed_envelope <= threshold):
+        if run_end - run_start <= min_inner:
+            continue
+        center = (run_start + run_end) // 2
+        left = max(run_start, center - keep_inner // 2)
+        right = min(run_end, left + keep_inner)
+        keep_mask[run_start:left] = False
+        keep_mask[right:run_end] = False
+
+    cleaned = trimmed[keep_mask]
+    sf.write(str(output), cleaned, sample_rate)
+    return output
 
 
 def _base_speed_factor(translation: list[dict], tts_files: list[Path]) -> float:
@@ -62,6 +129,10 @@ def _stretch_segment(audio_file: Path, ratio: float, target_sec: float, cache_di
     return y[: int(target_sec * sr)], sr
 
 
+def _silence(seconds: float, sample_rate: int) -> np.ndarray:
+    return np.zeros(int(seconds * sample_rate), dtype=np.float32)
+
+
 def _local_factor(current_sec: float, base: float, desired_sec: float) -> float:
     first = current_sec * base
     if first <= 1e-3:
@@ -69,17 +140,15 @@ def _local_factor(current_sec: float, base: float, desired_sec: float) -> float:
     return max(min(desired_sec / first, LOCAL_FACTOR_MAX), LOCAL_FACTOR_MIN)
 
 
-def _silence(seconds: float, sample_rate: int) -> np.ndarray:
-    return np.zeros(int(seconds * sample_rate), dtype=np.float32)
-
-
 def merge_tts_audio(translation_file: Path, tts_dir: Path, session: Path) -> tuple[Path, Path]:
     dubbing_file = session / "tmp" / "audio_dubbing.wav"
     timings_file = session / "metadata" / "timings.json"
     cache_dir = session / "segments" / "stretched"
+    trimmed_dir = session / "segments" / "trimmed"
     dubbing_file.parent.mkdir(parents=True, exist_ok=True)
     timings_file.parent.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    trimmed_dir.mkdir(parents=True, exist_ok=True)
     if dubbing_file.exists() and timings_file.exists():
         return dubbing_file, timings_file
 
@@ -90,6 +159,7 @@ def merge_tts_audio(translation_file: Path, tts_dir: Path, session: Path) -> tup
         if not path.exists():
             raise FileNotFoundError(f"Missing TTS segment: {path}")
 
+    tts_files = [_trim_tts_file(path, trimmed_dir) for path in tts_files]
     _, sample_rate = _audio_duration(tts_files[0])
     base = _base_speed_factor(translation, tts_files)
 
@@ -114,6 +184,7 @@ def merge_tts_audio(translation_file: Path, tts_dir: Path, session: Path) -> tup
         final_audio = np.concatenate([final_audio, y])
         segment["actual_start_time"] = int(real_start_ms)
         segment["actual_end_time"] = int(real_end_ms)
+        segment["stretch_factor"] = round(speed, 4)
 
     sf.write(str(dubbing_file), final_audio, sample_rate)
     timings_file.write_text(

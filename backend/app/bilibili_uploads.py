@@ -76,6 +76,7 @@ def _run_job(job_id: str) -> None:
                 path=session_path,
                 title=job["title"],
                 dtime=job["dtime"],
+                cover=job.get("cover_path"),
                 author_tags_json=bilibili_settings["author_tags_json"],
             )
         )

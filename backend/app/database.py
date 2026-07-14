@@ -73,6 +73,7 @@ def init_db() -> None:
               title TEXT NOT NULL,
               publish_mode TEXT NOT NULL,
               dtime TEXT,
+              cover_path TEXT,
               status TEXT NOT NULL,
               log_path TEXT,
               error_message TEXT,
@@ -131,6 +132,11 @@ def init_db() -> None:
         stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_stages)").fetchall()}
         if "progress" not in stage_columns:
             conn.execute("ALTER TABLE task_stages ADD COLUMN progress INTEGER")
+        bilibili_upload_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(bilibili_upload_jobs)").fetchall()
+        }
+        if "cover_path" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN cover_path TEXT")
 
 
 def backfill_titles_from_metadata() -> None:
@@ -530,6 +536,7 @@ def create_bilibili_upload_job(
     title: str,
     publish_mode: str,
     dtime: str | None = None,
+    cover_path: str | None = None,
     job_id: str | None = None,
 ) -> str:
     new_id = job_id or str(uuid.uuid4())
@@ -538,10 +545,10 @@ def create_bilibili_upload_job(
         conn.execute(
             """
             INSERT INTO bilibili_upload_jobs (
-              id, task_id, title, publish_mode, dtime, status, log_path, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+              id, task_id, title, publish_mode, dtime, cover_path, status, log_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
-            (new_id, task_id, title, publish_mode, dtime, str(log), now_iso()),
+            (new_id, task_id, title, publish_mode, dtime, cover_path, str(log), now_iso()),
         )
     return new_id
 

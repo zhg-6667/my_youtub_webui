@@ -8,10 +8,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from . import bilibili_uploads, database, watermark_masks, worker
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
@@ -28,9 +28,11 @@ from .youtube import LOCAL_UPLOAD_DIRECTIONS, extract_video_id, is_local_upload_
 
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv"}
 ALLOWED_SUBTITLE_SUFFIXES = {".srt"}
+ALLOWED_BILIBILI_COVER_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 LOCAL_UPLOAD_CHUNK_SIZE = 1024 * 1024
 MAX_LOCAL_UPLOAD_BYTES = int(os.getenv("LOCAL_UPLOAD_MAX_BYTES", str(4 * 1024 * 1024 * 1024)))
 MAX_LOCAL_SUBTITLE_BYTES = int(os.getenv("LOCAL_SUBTITLE_MAX_BYTES", str(20 * 1024 * 1024)))
+MAX_BILIBILI_COVER_BYTES = int(os.getenv("BILIBILI_COVER_MAX_BYTES", str(20 * 1024 * 1024)))
 
 
 def mask_secret(value: str) -> str:
@@ -365,6 +367,16 @@ def _clean_subtitle_filename(filename: str | None) -> str:
     return f"{safe_stem}{suffix}"
 
 
+def _bilibili_cover_suffix(filename: str | None) -> str:
+    original = Path(filename or "").name.strip()
+    if not original:
+        raise HTTPException(status_code=422, detail="Cover filename is required.")
+    suffix = Path(original).suffix.lower()
+    if suffix not in ALLOWED_BILIBILI_COVER_SUFFIXES:
+        raise HTTPException(status_code=422, detail="Only .jpg, .jpeg, .png, or .webp cover images are supported.")
+    return suffix
+
+
 def _save_uploaded_file(file: UploadFile, destination: Path, *, max_bytes: int, too_large_detail: str) -> int:
     total = 0
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -616,7 +628,25 @@ def _normalize_watermark_mask_mode(value: str) -> str:
 
 
 @app.post("/api/tasks/{task_id}/bilibili-upload", status_code=202)
-def create_bilibili_upload(task_id: str, payload: BilibiliUploadRequest) -> dict:
+async def create_bilibili_upload(task_id: str, request: Request) -> dict:
+    cover_file: UploadFile | None = None
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
+        form = await request.form()
+        payload = BilibiliUploadRequest(
+            title=str(form.get("title") or ""),
+            publish_mode=str(form.get("publish_mode") or "now"),
+            dtime=str(form.get("dtime") or "") or None,
+        )
+        maybe_cover = form.get("cover_file")
+        if maybe_cover is not None and getattr(maybe_cover, "filename", ""):
+            cover_file = maybe_cover  # type: ignore[assignment]
+    else:
+        try:
+            payload = BilibiliUploadRequest(**(await request.json()))
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
@@ -650,11 +680,26 @@ def create_bilibili_upload(task_id: str, payload: BilibiliUploadRequest) -> dict
     if active:
         raise HTTPException(status_code=409, detail="This task already has a Bilibili upload in progress.")
 
+    job_id = str(uuid.uuid4())
+    cover_path: str | None = None
+    if cover_file is not None:
+        suffix = _bilibili_cover_suffix(cover_file.filename)
+        cover_dest = Path(session_path) / "metadata" / "bilibili_upload_covers" / f"{job_id}{suffix}"
+        _save_uploaded_file(
+            cover_file,
+            cover_dest,
+            max_bytes=MAX_BILIBILI_COVER_BYTES,
+            too_large_detail="Uploaded Bilibili cover image is too large.",
+        )
+        cover_path = str(cover_dest)
+
     job_id = database.create_bilibili_upload_job(
         task_id,
         title=title,
         publish_mode=publish_mode,
         dtime=dtime,
+        cover_path=cover_path,
+        job_id=job_id,
     )
     bilibili_uploads.enqueue(job_id)
     return database.get_bilibili_upload_job(job_id)
