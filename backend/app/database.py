@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -104,10 +105,37 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS video_link_records (
               id TEXT PRIMARY KEY,
               url TEXT NOT NULL,
+              duration_seconds INTEGER,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
               last_task_id TEXT,
               FOREIGN KEY (last_task_id) REFERENCES tasks(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS youtube_channel_monitors (
+              id TEXT PRIMARY KEY,
+              channel_url TEXT NOT NULL,
+              channel_id TEXT NOT NULL,
+              title TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              check_interval_minutes INTEGER NOT NULL DEFAULT 30,
+              latest_count INTEGER NOT NULL DEFAULT 2,
+              last_checked_at TEXT,
+              last_error TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS youtube_channel_seen_videos (
+              monitor_id TEXT NOT NULL,
+              video_id TEXT NOT NULL,
+              url TEXT NOT NULL,
+              title TEXT,
+              duration_seconds INTEGER,
+              published_at TEXT,
+              discovered_at TEXT NOT NULL,
+              PRIMARY KEY (monitor_id, video_id),
+              FOREIGN KEY (monitor_id) REFERENCES youtube_channel_monitors(id) ON DELETE CASCADE
             );
             """
         )
@@ -141,11 +169,36 @@ def init_db() -> None:
         stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_stages)").fetchall()}
         if "progress" not in stage_columns:
             conn.execute("ALTER TABLE task_stages ADD COLUMN progress INTEGER")
+        video_link_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(video_link_records)").fetchall()
+        }
+        if "duration_seconds" not in video_link_columns:
+            conn.execute("ALTER TABLE video_link_records ADD COLUMN duration_seconds INTEGER")
+        monitor_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(youtube_channel_monitors)").fetchall()
+        }
+        if "latest_count" not in monitor_columns:
+            conn.execute("ALTER TABLE youtube_channel_monitors ADD COLUMN latest_count INTEGER NOT NULL DEFAULT 2")
+        seen_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(youtube_channel_seen_videos)").fetchall()
+        }
+        if "duration_seconds" not in seen_columns:
+            conn.execute("ALTER TABLE youtube_channel_seen_videos ADD COLUMN duration_seconds INTEGER")
         bilibili_upload_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(bilibili_upload_jobs)").fetchall()
         }
         if "cover_path" not in bilibili_upload_columns:
             conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN cover_path TEXT")
+        task_ids = [row["id"] for row in conn.execute("SELECT id FROM tasks").fetchall()]
+        for task_id in task_ids:
+            for stage in STAGES:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_stages (task_id, name, label, status)
+                    VALUES (?, ?, ?, 'pending')
+                    """,
+                    (task_id, stage.name, stage.label),
+                )
 
 
 def backfill_titles_from_metadata() -> None:
@@ -284,6 +337,8 @@ def get_task(task_id: str) -> dict[str, Any] | None:
                 WHEN 'tts' THEN 7
                 WHEN 'merge_audio' THEN 8
                 WHEN 'merge_video' THEN 9
+                WHEN 'concat_video' THEN 10
+                WHEN 'trim_video' THEN 11
                 ELSE 99
               END
             """,
@@ -380,17 +435,22 @@ def update_task(task_id: str, **fields: Any) -> None:
         conn.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", values)
 
 
-def upsert_video_link_record(url: str, record_id: str | None = None) -> dict[str, Any]:
+def upsert_video_link_record(
+    url: str, record_id: str | None = None, *, duration_seconds: int | None = None
+) -> dict[str, Any]:
     new_id = record_id or str(uuid.uuid4())
     updated_at = now_iso()
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO video_link_records (id, url, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at
+            INSERT INTO video_link_records (id, url, duration_seconds, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              url = excluded.url,
+              duration_seconds = COALESCE(excluded.duration_seconds, video_link_records.duration_seconds),
+              updated_at = excluded.updated_at
             """,
-            (new_id, url, updated_at, updated_at),
+            (new_id, url, duration_seconds, updated_at, updated_at),
         )
         row = conn.execute("SELECT * FROM video_link_records WHERE id = ?", (new_id,)).fetchone()
     return dict(row)
@@ -400,7 +460,7 @@ def list_video_link_records(limit: int = 100) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, url, created_at, updated_at, last_task_id
+            SELECT id, url, duration_seconds, created_at, updated_at, last_task_id
             FROM video_link_records
             ORDER BY updated_at DESC, rowid DESC LIMIT ?
             """,
@@ -421,6 +481,132 @@ def mark_video_link_record_task(record_id: str, task_id: str) -> None:
             "UPDATE video_link_records SET last_task_id = ?, updated_at = ? WHERE id = ?",
             (task_id, now_iso(), record_id),
         )
+
+
+def create_youtube_channel_monitor(
+    *,
+    channel_url: str,
+    channel_id: str,
+    title: str | None = None,
+    enabled: bool = True,
+    check_interval_minutes: int = 30,
+    latest_count: int = 2,
+) -> dict[str, Any]:
+    monitor_id = str(uuid.uuid4())
+    created_at = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO youtube_channel_monitors (
+              id, channel_url, channel_id, title, enabled, check_interval_minutes,
+              latest_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                monitor_id,
+                channel_url,
+                channel_id,
+                title,
+                1 if enabled else 0,
+                check_interval_minutes,
+                latest_count,
+                created_at,
+                created_at,
+            ),
+        )
+        row = conn.execute("SELECT * FROM youtube_channel_monitors WHERE id = ?", (monitor_id,)).fetchone()
+    return dict(row)
+
+
+def list_youtube_channel_monitors() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM youtube_channel_monitors
+            ORDER BY created_at DESC, rowid DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_enabled_youtube_channel_monitors() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM youtube_channel_monitors
+            WHERE enabled = 1
+            ORDER BY created_at ASC, rowid ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_youtube_channel_monitor(monitor_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM youtube_channel_monitors WHERE id = ?", (monitor_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_youtube_channel_monitor(monitor_id: str, **fields: Any) -> dict[str, Any] | None:
+    if fields:
+        fields["updated_at"] = now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [monitor_id]
+        with connect() as conn:
+            conn.execute(f"UPDATE youtube_channel_monitors SET {assignments} WHERE id = ?", values)
+    return get_youtube_channel_monitor(monitor_id)
+
+
+def delete_youtube_channel_monitor(monitor_id: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute("DELETE FROM youtube_channel_monitors WHERE id = ?", (monitor_id,))
+        return cursor.rowcount > 0
+
+
+def has_seen_youtube_channel_video(monitor_id: str, video_id: str) -> bool:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM youtube_channel_seen_videos
+            WHERE monitor_id = ? AND video_id = ?
+            LIMIT 1
+            """,
+            (monitor_id, video_id),
+        ).fetchone()
+    return row is not None
+
+
+def mark_youtube_channel_video_seen(
+    *,
+    monitor_id: str,
+    video_id: str,
+    url: str,
+    title: str | None = None,
+    duration_seconds: int | None = None,
+    published_at: str | None = None,
+) -> None:
+    discovered_at = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO youtube_channel_seen_videos (
+              monitor_id, video_id, url, title, duration_seconds, published_at, discovered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (monitor_id, video_id, url, title, duration_seconds, published_at, discovered_at),
+        )
+
+
+def update_youtube_channel_monitor_check(
+    monitor_id: str, *, last_error: str | None = None
+) -> dict[str, Any] | None:
+    return update_youtube_channel_monitor(
+        monitor_id,
+        last_checked_at=now_iso(),
+        last_error=last_error,
+    )
 
 
 def get_task_cut_intervals(task_id: str) -> str | None:
@@ -510,14 +696,39 @@ def save_ytdlp_settings(proxy_port: str) -> None:
     set_setting("ytdlp.proxy_port", proxy_port.strip())
 
 
+def _merged_bilibili_author_config(author_tags_json: str, author_tids_json: str) -> str:
+    merged: dict[str, dict[str, str | int]] = {}
+    if author_tags_json.strip():
+        for author, tags in json.loads(author_tags_json).items():
+            merged.setdefault(author, {})["tags"] = tags
+    if author_tids_json.strip():
+        for author, tid in json.loads(author_tids_json).items():
+            merged.setdefault(author, {})["tid"] = tid
+    return json.dumps(merged, ensure_ascii=False) if merged else ""
+
+
 def get_bilibili_settings() -> dict[str, str]:
+    author_config_json = get_setting("bilibili.author_config_json", "")
+    author_tags_json = get_setting("bilibili.author_tags_json", "")
+    author_tids_json = get_setting("bilibili.author_tids_json", "")
+    if not author_config_json.strip():
+        author_config_json = _merged_bilibili_author_config(author_tags_json, author_tids_json)
     return {
-        "author_tags_json": get_setting("bilibili.author_tags_json", ""),
+        "author_config_json": author_config_json,
+        "author_tags_json": author_tags_json,
+        "author_tids_json": author_tids_json,
     }
 
 
-def save_bilibili_settings(author_tags_json: str) -> None:
+def save_bilibili_settings(
+    author_tags_json: str = "",
+    author_tids_json: str = "",
+    *,
+    author_config_json: str = "",
+) -> None:
+    set_setting("bilibili.author_config_json", author_config_json.strip())
     set_setting("bilibili.author_tags_json", author_tags_json.strip())
+    set_setting("bilibili.author_tids_json", author_tids_json.strip())
 
 
 def get_mail_settings() -> dict[str, str]:

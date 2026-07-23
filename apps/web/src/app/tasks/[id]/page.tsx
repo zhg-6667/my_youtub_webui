@@ -8,6 +8,7 @@ import {
   Download,
   FileText,
   ImageIcon,
+  Languages,
   Loader2,
   Plus,
   Play,
@@ -27,6 +28,7 @@ import {
   Task,
   WatermarkMaskJob,
   WatermarkMaskMode,
+  concatVideo,
   continueTask,
   createBilibiliUploadJob,
   createWatermarkMaskJob,
@@ -42,11 +44,11 @@ import {
   rerunTask,
   resumeTask,
   saveCutIntervals,
+  translateBilibiliTitle,
   trimVideo,
 } from "@/lib/api"
 import { useI18n } from "@/lib/i18n"
 import { statusBadgeClass } from "@/lib/status"
-import { AppHeader } from "@/components/app-header"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -145,8 +147,7 @@ function secondsToRange(interval: CutInterval): TrimRangeInput {
   }
 }
 
-export default function TaskDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params)
+export function TaskDetailContent({ id }: { id: string }) {
   const router = useRouter()
   const { stageLabel, statusLabel, t } = useI18n()
   const [task, setTask] = useState<Task | null>(null)
@@ -165,6 +166,8 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [redoingStage, setRedoingStage] = useState<string | null>(null)
   const [redoConfirmStage, setRedoConfirmStage] = useState<string | null>(null)
   const [redoError, setRedoError] = useState("")
+  const [concatenating, setConcatenating] = useState(false)
+  const [concatError, setConcatError] = useState("")
   const [trimming, setTrimming] = useState(false)
   const [trimError, setTrimError] = useState("")
   const [savingTrimIntervals, setSavingTrimIntervals] = useState(false)
@@ -177,6 +180,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [bilibiliPublishMode, setBilibiliPublishMode] = useState<BilibiliPublishMode>("now")
   const [bilibiliDtime, setBilibiliDtime] = useState("")
   const [creatingBilibiliJob, setCreatingBilibiliJob] = useState(false)
+  const [translatingBilibiliTitle, setTranslatingBilibiliTitle] = useState(false)
   const [bilibiliJob, setBilibiliJob] = useState<BilibiliUploadJob | null>(null)
   const [bilibiliError, setBilibiliError] = useState("")
   const [watermarkMode, setWatermarkMode] = useState<WatermarkMaskMode>("patch")
@@ -189,7 +193,12 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     setDeleteError("")
     try {
       await deleteTask(id)
-      router.replace("/")
+      const closeEvent = new CustomEvent("youdub:close-tab", {
+        cancelable: true,
+        detail: { key: `task:${id}` },
+      })
+      const handled = !window.dispatchEvent(closeEvent)
+      if (!handled) router.replace("/")
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : t.task.deleteError)
       setDeleting(false)
@@ -353,6 +362,37 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     }
   }
 
+  const handleConcat = async () => {
+    setConcatenating(true)
+    setConcatError("")
+    try {
+      const next = await concatVideo(id)
+      setTask(next)
+    } catch (err) {
+      setConcatError(err instanceof Error ? err.message : t.task.concatStageError)
+    } finally {
+      setConcatenating(false)
+    }
+  }
+
+  const handleTranslateBilibiliTitle = async () => {
+    const sourceTitle = bilibiliTitle.trim() || task?.title || ""
+    if (!sourceTitle.trim()) {
+      setBilibiliError(t.task.bilibiliTitleRequired)
+      return
+    }
+    setTranslatingBilibiliTitle(true)
+    setBilibiliError("")
+    try {
+      const result = await translateBilibiliTitle(id, sourceTitle)
+      setBilibiliTitle(result.title)
+    } catch (err) {
+      setBilibiliError(err instanceof Error ? err.message : t.task.bilibiliTitleTranslateError)
+    } finally {
+      setTranslatingBilibiliTitle(false)
+    }
+  }
+
   const handleQuickBilibiliDtime = (time: string) => {
     const datePart = bilibiliDtime.includes("T") ? bilibiliDtime.split("T")[0] : localDatePart()
     setBilibiliDtime(`${datePart}T${time}`)
@@ -377,8 +417,10 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const isPaused = task?.status === "paused"
   const isManual = task?.execution_mode === "manual"
   const isBilibiliTask = task?.source_name === "bilibili"
+  const displayVideoPath = task?.display_video_path || task?.final_video_path || null
   const canRedoStage = isManual && !isRunning && !isQueued
   const canTrim = !isRunning && !isQueued
+  const canConcat = !isRunning && !isQueued
   const canEditTrimIntervals = Boolean(task) && !(task?.status === "running" && task.current_stage === "trim_video")
   const redoConfirmStageInfo = task?.stages.find((stage) => stage.name === redoConfirmStage)
 
@@ -470,22 +512,16 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
 
   if (error && !task) {
     return (
-      <main className="min-h-screen bg-[linear-gradient(135deg,#fff5f5_0%,#f2fbff_48%,#fff4fa_100%)] text-foreground">
-        <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
-          <AppHeader backHref="/" />
-          <Card>
-            <CardContent className="px-6 py-10 text-sm text-red-600">{error}</CardContent>
-          </Card>
-        </div>
-      </main>
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6">
+        <Card>
+          <CardContent className="px-6 py-10 text-sm text-red-600">{error}</CardContent>
+        </Card>
+      </div>
     )
   }
 
   return (
-    <main className="min-h-screen bg-[linear-gradient(135deg,#fff5f5_0%,#f2fbff_48%,#fff4fa_100%)] text-foreground">
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
-        <AppHeader backHref="/" />
-
+    <div className="mx-auto flex w-full max-w-4xl flex-col gap-6">
         <Card>
           <CardHeader className="gap-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -536,7 +572,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
           </CardContent>
         </Card>
 
-        {task?.status === "succeeded" && task.final_video_path ? (
+        {task && displayVideoPath ? (
           <Card>
             <CardHeader>
               <CardTitle>{t.task.finalVideo}</CardTitle>
@@ -549,7 +585,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                 preload="metadata"
                 className="w-full rounded-md border border-emerald-200 bg-black"
               />
-              <p className="break-all text-xs text-muted-foreground">{task.final_video_path}</p>
+              <p className="break-all text-xs text-muted-foreground">{displayVideoPath}</p>
               <div className="flex flex-wrap gap-2">
                 <Button nativeButton={false} render={<a href={finalVideoDownloadUrl(task.id)} />}>
                   <Download className="size-4" />
@@ -571,13 +607,25 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                         <DialogDescription>{t.task.publishBilibiliDescription}</DialogDescription>
                       </DialogHeader>
                       <div className="space-y-2">
-                        <Label htmlFor="bilibili-title">{t.task.bilibiliTitleLabel}</Label>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <Label htmlFor="bilibili-title">{t.task.bilibiliTitleLabel}</Label>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={handleTranslateBilibiliTitle}
+                            disabled={creatingBilibiliJob || translatingBilibiliTitle}
+                          >
+                            {translatingBilibiliTitle ? <Loader2 className="size-4 animate-spin" /> : <Languages className="size-4" />}
+                            {translatingBilibiliTitle ? t.task.bilibiliTitleTranslating : t.task.bilibiliTitleTranslate}
+                          </Button>
+                        </div>
                         <Input
                           id="bilibili-title"
                           value={bilibiliTitle}
                           onChange={(event) => setBilibiliTitle(event.target.value)}
                           placeholder={task.title || t.task.bilibiliTitlePlaceholder}
-                          disabled={creatingBilibiliJob}
+                          disabled={creatingBilibiliJob || translatingBilibiliTitle}
                         />
                         <p className="text-xs text-muted-foreground">{t.task.bilibiliTitleHelp}</p>
                       </div>
@@ -589,7 +637,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                           type="file"
                           accept="image/jpeg,image/png,image/webp"
                           onChange={(event) => setBilibiliCoverFile(event.target.files?.[0] ?? null)}
-                          disabled={creatingBilibiliJob}
+                          disabled={creatingBilibiliJob || translatingBilibiliTitle}
                           className="h-10"
                         />
                         <div className="flex flex-wrap items-center gap-2">
@@ -605,7 +653,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                                 setBilibiliCoverFile(null)
                                 setBilibiliCoverInputKey((current) => current + 1)
                               }}
-                              disabled={creatingBilibiliJob}
+                              disabled={creatingBilibiliJob || translatingBilibiliTitle}
                             >
                               <ImageIcon className="size-3" />
                               {t.task.bilibiliCoverClear}
@@ -618,7 +666,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                         <Select
                           value={bilibiliPublishMode}
                           onValueChange={(value) => setBilibiliPublishMode(value as BilibiliPublishMode)}
-                          disabled={creatingBilibiliJob}
+                          disabled={creatingBilibiliJob || translatingBilibiliTitle}
                         >
                           <SelectTrigger id="bilibili-publish-mode" className="h-10">
                             <SelectValue />
@@ -637,7 +685,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                             type="datetime-local"
                             value={bilibiliDtime}
                             onChange={(event) => setBilibiliDtime(event.target.value)}
-                            disabled={creatingBilibiliJob}
+                            disabled={creatingBilibiliJob || translatingBilibiliTitle}
                           />
                           <div className="flex flex-wrap gap-2">
                             <Button
@@ -645,7 +693,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                               variant="outline"
                               size="sm"
                               onClick={() => handleQuickBilibiliDtime("05:00")}
-                              disabled={creatingBilibiliJob}
+                              disabled={creatingBilibiliJob || translatingBilibiliTitle}
                             >
                               {t.task.bilibiliQuickMorning}
                             </Button>
@@ -654,7 +702,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                               variant="outline"
                               size="sm"
                               onClick={() => handleQuickBilibiliDtime("11:00")}
-                              disabled={creatingBilibiliJob}
+                              disabled={creatingBilibiliJob || translatingBilibiliTitle}
                             >
                               {t.task.bilibiliQuickNoon}
                             </Button>
@@ -663,7 +711,7 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                               variant="outline"
                               size="sm"
                               onClick={() => handleQuickBilibiliDtime("19:30")}
-                              disabled={creatingBilibiliJob}
+                              disabled={creatingBilibiliJob || translatingBilibiliTitle}
                             >
                               {t.task.bilibiliQuickEvening}
                             </Button>
@@ -676,10 +724,10 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                         </div>
                       ) : null}
                       <DialogFooter>
-                        <DialogClose render={<Button type="button" variant="outline" disabled={creatingBilibiliJob} />}>
+                        <DialogClose render={<Button type="button" variant="outline" disabled={creatingBilibiliJob || translatingBilibiliTitle} />}>
                           {t.common.cancel}
                         </DialogClose>
-                        <Button type="submit" disabled={creatingBilibiliJob}>
+                        <Button type="submit" disabled={creatingBilibiliJob || translatingBilibiliTitle}>
                           {creatingBilibiliJob ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
                           {creatingBilibiliJob ? t.task.creatingBilibiliJob : t.task.startBilibiliUpload}
                         </Button>
@@ -772,6 +820,21 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
           <CardContent>
             {isManual && canRedoStage ? (
               <p className="mb-3 text-sm text-muted-foreground">{t.task.redoStageHelp}</p>
+            ) : null}
+            {task?.stages.some((s) => s.name === "concat_video") ? (
+              <div className="mb-4 flex flex-col gap-3 rounded-lg border border-emerald-100 bg-emerald-50 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <p className="text-sm text-emerald-950">{t.task.concatStageHelp}</p>
+                <Button
+                  type="button"
+                  size="sm"
+                  className="self-start"
+                  onClick={handleConcat}
+                  disabled={!canConcat || concatenating}
+                >
+                  {concatenating ? <Loader2 className="size-3 animate-spin" /> : <Plus className="size-3" />}
+                  {concatenating ? t.task.concatenatingStage : t.task.concatStage}
+                </Button>
+              </div>
             ) : null}
             {task?.stages.some((s) => s.name === "trim_video") ? (
               <div className="mb-4 space-y-3 rounded-lg border border-sky-100 bg-sky-50 px-3 py-3">
@@ -883,6 +946,11 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
             {redoError ? (
               <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
                 {redoError}
+              </div>
+            ) : null}
+            {concatError ? (
+              <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {concatError}
               </div>
             ) : null}
             {trimError ? (
@@ -1120,7 +1188,11 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
             ) : null}
           </CardContent>
         </Card>
-      </div>
-    </main>
+    </div>
   )
+}
+
+export default function TaskDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = use(params)
+  return <TaskDetailContent id={id} />
 }

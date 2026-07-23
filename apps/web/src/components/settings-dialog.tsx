@@ -1,7 +1,7 @@
 "use client"
 
 import { FormEvent, useEffect, useState } from "react"
-import { Eye, EyeOff, RefreshCw, Settings } from "lucide-react"
+import { Eye, EyeOff, Plus, RefreshCw, Settings, Trash2 } from "lucide-react"
 
 import {
   getBilibiliSettings,
@@ -18,6 +18,10 @@ import {
 } from "@/lib/api"
 import { LANGUAGE_OPTIONS, useI18n } from "@/lib/i18n"
 import { Button } from "@/components/ui/button"
+import {
+  Card,
+  CardContent,
+} from "@/components/ui/card"
 import {
   Dialog,
   DialogContent,
@@ -45,7 +49,7 @@ type SettingsForm = {
   model: string
   translateConcurrency: string
   proxyPort: string
-  bilibiliAuthorTagsJson: string
+  bilibiliAuthorConfigJson: string
   mailEnabled: boolean
   mailSmtpHost: string
   mailSmtpPort: string
@@ -64,6 +68,13 @@ const SAVED_COOKIE_SENTINEL = "__YOUDUB_SAVED_COOKIE__"
 
 type MessageKey = "keySaved" | "saved"
 
+type BilibiliAuthorConfigRow = {
+  id: string
+  author: string
+  tags: string
+  tid: string
+}
+
 const defaultSettings: SettingsForm = {
   cookie: "",
   baseUrl: "https://api.openai.com/v1",
@@ -71,7 +82,7 @@ const defaultSettings: SettingsForm = {
   model: "gpt-4o-mini",
   translateConcurrency: "50",
   proxyPort: "",
-  bilibiliAuthorTagsJson: "",
+  bilibiliAuthorConfigJson: "",
   mailEnabled: false,
   mailSmtpHost: "",
   mailSmtpPort: "587",
@@ -88,9 +99,53 @@ function uniqueModels(models: string[]) {
   return Array.from(new Set(models.map((model) => model.trim()).filter(Boolean)))
 }
 
-export function SettingsDialog() {
+function newAuthorConfigRow(): BilibiliAuthorConfigRow {
+  return {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    author: "",
+    tags: "",
+    tid: "",
+  }
+}
+
+function parseAuthorConfigRows(value: string): BilibiliAuthorConfigRow[] {
+  const raw = value.trim()
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return []
+    return Object.entries(parsed).map(([author, profile]) => {
+      const item = profile && typeof profile === "object" && !Array.isArray(profile) ? profile as Record<string, unknown> : {}
+      return {
+        id: `${author}-${Math.random().toString(16).slice(2)}`,
+        author,
+        tags: typeof item.tags === "string" ? item.tags : "",
+        tid: typeof item.tid === "number" && Number.isInteger(item.tid) ? String(item.tid) : "",
+      }
+    })
+  } catch {
+    return []
+  }
+}
+
+function stringifyAuthorConfigRows(rows: BilibiliAuthorConfigRow[]) {
+  const normalized: Record<string, { tags?: string; tid?: number }> = {}
+  for (const row of rows) {
+    const author = row.author.trim()
+    if (!author) continue
+    const item: { tags?: string; tid?: number } = {}
+    const tags = row.tags.trim()
+    const tid = row.tid.trim()
+    if (tags) item.tags = tags
+    if (/^[1-9]\d*$/.test(tid)) item.tid = Number(tid)
+    normalized[author] = item
+  }
+  return Object.keys(normalized).length ? JSON.stringify(normalized, null, 2) : ""
+}
+
+export function SettingsDialog({ asPanel = false }: { asPanel?: boolean } = {}) {
   const { language, loadedModelsText, setLanguage, t } = useI18n()
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(asPanel)
   const [settings, setSettings] = useState(defaultSettings)
   const [message, setMessage] = useState("")
   const [messageKey, setMessageKey] = useState<MessageKey | null>(null)
@@ -102,6 +157,7 @@ export function SettingsDialog() {
   const [cookieDirty, setCookieDirty] = useState(false)
   const [apiKeyDirty, setApiKeyDirty] = useState(false)
   const [smtpPasswordDirty, setSmtpPasswordDirty] = useState(false)
+  const [bilibiliAuthorRows, setBilibiliAuthorRows] = useState<BilibiliAuthorConfigRow[]>([])
 
   const cookieValue =
     settings.cookie === SAVED_COOKIE_SENTINEL ? t.settings.savedCookie : settings.cookie
@@ -109,7 +165,7 @@ export function SettingsDialog() {
     messageKey === "keySaved" ? t.settings.keySaved : messageKey === "saved" ? t.settings.saved : message
 
   useEffect(() => {
-    if (!open) return
+    if (!open && !asPanel) return
     Promise.all([getCookieInfo(), getOpenAISettings(), getYtdlpSettings(), getBilibiliSettings(), getMailSettings()])
       .then(([cookie, openai, ytdlp, bilibili, mail]) => {
         setSettings({
@@ -119,7 +175,7 @@ export function SettingsDialog() {
           model: openai.model,
           translateConcurrency: openai.translate_concurrency || "50",
           proxyPort: ytdlp.proxy_port,
-          bilibiliAuthorTagsJson: bilibili.author_tags_json,
+          bilibiliAuthorConfigJson: bilibili.author_config_json,
           mailEnabled: mail.enabled,
           mailSmtpHost: mail.smtp_host,
           mailSmtpPort: mail.smtp_port || "587",
@@ -131,6 +187,7 @@ export function SettingsDialog() {
           mailNotifyOnSuccess: mail.notify_on_success,
           mailNotifyOnFailure: mail.notify_on_failure,
         })
+        setBilibiliAuthorRows(parseAuthorConfigRows(bilibili.author_config_json))
         setModelOptions(uniqueModels([openai.model]))
         setModelsLoaded(false)
         setShowApiKey(false)
@@ -145,7 +202,7 @@ export function SettingsDialog() {
         setMessageKey(null)
         setMessage(err.message)
       })
-  }, [open])
+  }, [asPanel, open])
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -162,7 +219,11 @@ export function SettingsDialog() {
         translate_concurrency: settings.translateConcurrency,
       })
       const ytdlp = await saveYtdlpSettings({ proxy_port: settings.proxyPort })
-      const bilibili = await saveBilibiliSettings({ author_tags_json: settings.bilibiliAuthorTagsJson })
+      const bilibili = await saveBilibiliSettings({
+        author_config_json: settings.bilibiliAuthorConfigJson,
+        author_tags_json: "",
+        author_tids_json: "",
+      })
       const clearSmtpPassword = smtpPasswordDirty && !settings.mailSmtpPassword.trim()
       const mail = await saveMailSettings({
         enabled: settings.mailEnabled,
@@ -184,11 +245,12 @@ export function SettingsDialog() {
         cookie: cookieDirty ? (cookie?.exists ? SAVED_COOKIE_SENTINEL : "") : current.cookie,
         translateConcurrency: openai.translate_concurrency || current.translateConcurrency,
         proxyPort: ytdlp.proxy_port,
-        bilibiliAuthorTagsJson: bilibili.author_tags_json,
+        bilibiliAuthorConfigJson: bilibili.author_config_json,
         mailSmtpPassword: mail.has_smtp_password ? mail.smtp_password || SAVED_SMTP_PASSWORD_MASK : "",
         mailSmtpPort: mail.smtp_port,
         mailSmtpSecurity: mail.smtp_security,
       }))
+      setBilibiliAuthorRows(parseAuthorConfigRows(bilibili.author_config_json))
       setCookieDirty(false)
       setApiKeyDirty(false)
       setSmtpPasswordDirty(false)
@@ -220,18 +282,22 @@ export function SettingsDialog() {
     }
   }
 
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger render={<Button variant="outline" />}>
-        <Settings className="size-4" />
-        {t.settings.button}
-      </DialogTrigger>
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden sm:max-w-2xl">
-        <form onSubmit={submit} className="flex max-h-[calc(100dvh-4rem)] min-h-0 flex-col">
-          <DialogHeader className="shrink-0 pr-8">
+  const form = (
+    <form
+      onSubmit={submit}
+      className={asPanel ? "flex min-h-0 flex-col" : "flex max-h-[calc(100dvh-4rem)] min-h-0 flex-col"}
+    >
+      {asPanel ? (
+        <div className="shrink-0">
+          <h1 className="font-heading text-base leading-none font-medium">{t.settings.title}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{t.settings.description}</p>
+        </div>
+      ) : (
+        <DialogHeader className="shrink-0 pr-8">
             <DialogTitle>{t.settings.title}</DialogTitle>
             <DialogDescription>{t.settings.description}</DialogDescription>
-          </DialogHeader>
+        </DialogHeader>
+      )}
           <div className="mt-4 min-h-0 overflow-y-auto pr-1">
             <div className="grid gap-4 pb-4">
               <div className="grid gap-2">
@@ -291,17 +357,93 @@ export function SettingsDialog() {
                 />
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="bilibiliAuthorTagsJson">{t.settings.bilibiliAuthorTags}</Label>
-                <Textarea
-                  id="bilibiliAuthorTagsJson"
-                  value={settings.bilibiliAuthorTagsJson}
-                  onChange={(event) =>
-                    setSettings((current) => ({ ...current, bilibiliAuthorTagsJson: event.target.value }))
-                  }
-                  placeholder={'{"WolfeyVGC":"狼叔,宝可梦,VGC","SomeCreator":"科技,科普"}'}
-                  className="min-h-24 font-mono text-xs leading-relaxed"
-                />
-                <p className="text-xs text-muted-foreground">{t.settings.bilibiliAuthorTagsHelp}</p>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <Label>{t.settings.bilibiliAuthorConfig}</Label>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => updateBilibiliAuthorRows([...bilibiliAuthorRows, newAuthorConfigRow()])}
+                  >
+                    <Plus className="size-3" />
+                    {t.settings.bilibiliAuthorAdd}
+                  </Button>
+                </div>
+                <div className="overflow-hidden rounded-lg border border-border bg-background">
+                  <div className="hidden grid-cols-[1.1fr_1.3fr_7rem_2.5rem] gap-2 border-b border-border bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground md:grid">
+                    <span>{t.settings.bilibiliAuthorName}</span>
+                    <span>{t.settings.bilibiliAuthorTagsColumn}</span>
+                    <span>{t.settings.bilibiliAuthorTid}</span>
+                    <span />
+                  </div>
+                  {bilibiliAuthorRows.length ? (
+                    <div className="divide-y divide-border">
+                      {bilibiliAuthorRows.map((row, index) => (
+                        <div
+                          key={row.id}
+                          className="grid gap-2 px-3 py-3 md:grid-cols-[1.1fr_1.3fr_7rem_2.5rem] md:items-end"
+                        >
+                          <div className="grid gap-1">
+                            <Label htmlFor={`bilibili-author-${row.id}`} className="text-xs md:hidden">
+                              {t.settings.bilibiliAuthorName}
+                            </Label>
+                            <Input
+                              id={`bilibili-author-${row.id}`}
+                              value={row.author}
+                              onChange={(event) => updateBilibiliAuthorRow(row.id, "author", event.target.value)}
+                              placeholder={index === 0 ? "WolfeyVGC" : ""}
+                            />
+                          </div>
+                          <div className="grid gap-1">
+                            <Label htmlFor={`bilibili-tags-${row.id}`} className="text-xs md:hidden">
+                              {t.settings.bilibiliAuthorTagsColumn}
+                            </Label>
+                            <Input
+                              id={`bilibili-tags-${row.id}`}
+                              value={row.tags}
+                              onChange={(event) => updateBilibiliAuthorRow(row.id, "tags", event.target.value)}
+                              placeholder={index === 0 ? "狼叔,宝可梦,VGC" : ""}
+                            />
+                          </div>
+                          <div className="grid gap-1">
+                            <Label htmlFor={`bilibili-tid-${row.id}`} className="text-xs md:hidden">
+                              {t.settings.bilibiliAuthorTid}
+                            </Label>
+                            <Input
+                              id={`bilibili-tid-${row.id}`}
+                              inputMode="numeric"
+                              value={row.tid}
+                              onChange={(event) => updateBilibiliAuthorRow(row.id, "tid", event.target.value)}
+                              placeholder="17"
+                            />
+                          </div>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="justify-self-end"
+                            aria-label={t.settings.bilibiliAuthorRemove}
+                            onClick={() =>
+                              updateBilibiliAuthorRows(bilibiliAuthorRows.filter((item) => item.id !== row.id))
+                            }
+                          >
+                            <Trash2 className="size-4" />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+                      {t.settings.bilibiliAuthorEmpty}
+                    </div>
+                  )}
+                </div>
+                {settings.bilibiliAuthorConfigJson ? (
+                  <pre className="max-h-36 overflow-auto rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+                    {settings.bilibiliAuthorConfigJson}
+                  </pre>
+                ) : null}
+                <p className="text-xs text-muted-foreground">{t.settings.bilibiliAuthorConfigHelp}</p>
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="baseUrl">{t.settings.baseUrl}</Label>
@@ -572,10 +714,55 @@ export function SettingsDialog() {
               {visibleMessage ? <p className="text-sm text-muted-foreground">{visibleMessage}</p> : null}
             </div>
           </div>
-          <DialogFooter className="shrink-0">
-            <Button type="submit">{t.settings.save}</Button>
-          </DialogFooter>
-        </form>
+      {asPanel ? (
+        <div className="flex justify-end border-t border-border pt-4">
+          <Button type="submit">{t.settings.save}</Button>
+        </div>
+      ) : (
+        <DialogFooter className="shrink-0">
+          <Button type="submit">{t.settings.save}</Button>
+        </DialogFooter>
+      )}
+    </form>
+  )
+
+  if (asPanel) {
+    return (
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6">
+        <Card>
+          <CardContent className="p-6">{form}</CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  function updateBilibiliAuthorRows(nextRows: BilibiliAuthorConfigRow[]) {
+    setBilibiliAuthorRows(nextRows)
+    setSettings((current) => ({
+      ...current,
+      bilibiliAuthorConfigJson: stringifyAuthorConfigRows(nextRows),
+    }))
+  }
+
+  function updateBilibiliAuthorRow(
+    rowId: string,
+    field: keyof Omit<BilibiliAuthorConfigRow, "id">,
+    value: string,
+  ) {
+    const nextValue = field === "tid" ? value.replace(/\D/g, "") : value
+    updateBilibiliAuthorRows(
+      bilibiliAuthorRows.map((row) => (row.id === rowId ? { ...row, [field]: nextValue } : row)),
+    )
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger render={<Button variant="outline" />}>
+        <Settings className="size-4" />
+        {t.settings.button}
+      </DialogTrigger>
+      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden sm:max-w-2xl">
+        {form}
       </DialogContent>
     </Dialog>
   )

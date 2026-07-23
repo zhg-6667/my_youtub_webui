@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from backend.app.adapters import ffmpeg
 from backend.app.adapters import watermark_mask
 
@@ -194,6 +196,195 @@ def test_write_srt_splits_long_sentence_into_multiple_entries(tmp_path):
     blocks = [b for b in content.strip().split("\n\n") if b.strip()]
     assert len(blocks) >= 3
     assert all("-->" in b for b in blocks)
+
+
+def test_generate_cta_clip_matches_reference_stream(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final_video = media / "video_final.mp4"
+    final_video.write_bytes(b"final")
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, check=False, capture_output=False, text=False, **kwargs):
+        commands.append(cmd)
+        if "-show_entries" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    {
+                        "streams": [
+                            {
+                                "codec_type": "video",
+                                "codec_name": "h264",
+                                "profile": "High",
+                                "level": 51,
+                                "pix_fmt": "yuv420p",
+                                "width": 1280,
+                                "height": 720,
+                                "avg_frame_rate": "30000/1001",
+                            },
+                            {
+                                "codec_type": "audio",
+                                "codec_name": "aac",
+                                "sample_rate": "44100",
+                                "channels": 2,
+                                "channel_layout": "stereo",
+                            },
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        Path(cmd[-1]).write_bytes(b"cta")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+
+    output = ffmpeg.generate_cta_clip(final_video, session)
+
+    assert output == session / "media" / "cta_follow_2s.mp4"
+    ffmpeg_command = commands[-1]
+    assert "color=c=0x121418:s=1280x720:r=30000/1001:d=2" in ffmpeg_command
+    assert "anullsrc=channel_layout=stereo:sample_rate=44100:d=2" in ffmpeg_command
+    assert ffmpeg_command[ffmpeg_command.index("-c:v") + 1] == "libx264"
+    assert ffmpeg_command[ffmpeg_command.index("-profile:v") + 1] == "high"
+    assert ffmpeg_command[ffmpeg_command.index("-level:v") + 1] == "5.1"
+    assert ffmpeg_command[ffmpeg_command.index("-c:a") + 1] == "aac"
+
+
+def test_generate_cta_clip_matches_av1_opus_reference(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    source_video = media / "video_source.mp4"
+    source_video.write_bytes(b"source")
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, check=False, capture_output=False, text=False, **kwargs):
+        commands.append(cmd)
+        if "-show_entries" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    {
+                        "streams": [
+                            {
+                                "codec_type": "video",
+                                "codec_name": "av1",
+                                "profile": "Main",
+                                "level": 9,
+                                "pix_fmt": "yuv420p",
+                                "width": 1920,
+                                "height": 1080,
+                                "avg_frame_rate": "60/1",
+                                "time_base": "1/15360",
+                            },
+                            {
+                                "codec_type": "audio",
+                                "codec_name": "opus",
+                                "sample_rate": "48000",
+                                "channels": 2,
+                                "channel_layout": "stereo",
+                            },
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        Path(cmd[-1]).write_bytes(b"cta")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+
+    output = ffmpeg.generate_cta_clip(source_video, session)
+
+    assert output == media / "cta_follow_2s.mp4"
+    ffmpeg_command = commands[-1]
+    assert "color=c=0x121418:s=1920x1080:r=60/1:d=2" in ffmpeg_command
+    assert "anullsrc=channel_layout=stereo:sample_rate=48000:d=2" in ffmpeg_command
+    assert ffmpeg_command[ffmpeg_command.index("-c:v") + 1] == "libsvtav1"
+    assert ffmpeg_command[ffmpeg_command.index("-c:a") + 1] == "libopus"
+    assert ffmpeg_command[ffmpeg_command.index("-video_track_timescale") + 1] == "15360"
+
+
+def test_prepend_cta_clip_copy_concats_without_reencoding_input(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    media = session / "media"
+    tmp_dir = session / "tmp"
+    media.mkdir(parents=True)
+    tmp_dir.mkdir(parents=True)
+    final_video = media / "video_final.mp4"
+    cta_clip = tmp_dir / "cta_follow_2s.mp4"
+    final_video.write_bytes(b"final")
+    cta_clip.write_bytes(b"cta")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(ffmpeg, "generate_cta_clip", lambda reference, concat_session: cta_clip)
+    monkeypatch.setattr(ffmpeg, "_probe_duration", lambda path: 10.0 if path == final_video else 12.0)
+
+    def fake_run(cmd, check=False, cwd=None, **kwargs):
+        commands.append(cmd)
+        Path(cmd[-1]).write_bytes(b"concat")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+
+    output = ffmpeg.prepend_cta_clip(final_video, session)
+
+    assert output == media / "video_final_with_cta.mp4"
+    assert output.read_bytes() == b"concat"
+    assert commands[-1][commands[-1].index("-f") + 1] == "concat"
+    assert commands[-1][commands[-1].index("-c") + 1] == "copy"
+    assert "-filter_complex" not in commands[-1]
+    assert "-c:v" not in commands[-1]
+    concat_file = tmp_dir / "concat_video.txt"
+    assert concat_file.read_text(encoding="utf-8").splitlines() == [
+        f"file '{ffmpeg._concat_file_path(cta_clip.resolve())}'",
+        f"file '{ffmpeg._concat_file_path(final_video.resolve())}'",
+    ]
+
+
+def test_prepend_cta_clip_rejects_output_as_input(tmp_path):
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    output = media / "video_final_with_cta.mp4"
+    output.write_bytes(b"old")
+
+    with pytest.raises(ValueError, match="Cannot prepend CTA clip to its own output"):
+        ffmpeg.prepend_cta_clip(output, session)
+
+    assert output.read_bytes() == b"old"
+
+
+def test_prepend_cta_clip_rejects_too_short_output(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    media = session / "media"
+    tmp_dir = session / "tmp"
+    media.mkdir(parents=True)
+    tmp_dir.mkdir(parents=True)
+    final_video = media / "video_final.mp4"
+    cta_clip = tmp_dir / "cta_follow_2s.mp4"
+    final_video.write_bytes(b"final")
+    cta_clip.write_bytes(b"cta")
+
+    monkeypatch.setattr(ffmpeg, "generate_cta_clip", lambda reference, concat_session: cta_clip)
+    monkeypatch.setattr(ffmpeg, "_probe_duration", lambda path: 100.0 if path == final_video else 2.0)
+
+    def fake_run(cmd, check=False, cwd=None, **kwargs):
+        Path(cmd[-1]).write_bytes(b"bad")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="Concatenated video is too short"):
+        ffmpeg.prepend_cta_clip(final_video, session)
+
+    assert not (media / "video_final_with_cta.mp4").exists()
+    assert not (tmp_dir / "video_final_with_cta.tmp.mp4").exists()
 
 
 

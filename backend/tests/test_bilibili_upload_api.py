@@ -83,9 +83,22 @@ def test_create_bilibili_upload_job_with_cover(monkeypatch, tmp_path):
     assert enqueued == [body["id"]]
 
 
-def test_create_bilibili_upload_requires_succeeded_task(monkeypatch, tmp_path):
+def test_create_bilibili_upload_job_uses_concat_video_when_trimmed_missing(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
-    task_id = database.create_task("https://www.youtube.com/watch?v=notdone12345", task_id="notdone12345")
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.bilibili_uploads, "enqueue", enqueued.append)
+    task_id = database.create_task("https://www.youtube.com/watch?v=concat01", task_id="concat01")
+    session = tmp_path / "workfolder" / "Uploader" / "Title__concat01"
+    media = session / "media"
+    media.mkdir(parents=True)
+    (media / "video_final_with_cta.mp4").write_bytes(b"concat")
+    database.update_task(
+        task_id,
+        status="succeeded",
+        session_path=str(session),
+        final_video_path=None,
+        completed_at=database.now_iso(),
+    )
     client = TestClient(main.app)
 
     response = client.post(
@@ -93,7 +106,56 @@ def test_create_bilibili_upload_requires_succeeded_task(monkeypatch, tmp_path):
         json={"title": "测试标题", "publish_mode": "now"},
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 202
+    assert enqueued == [response.json()["id"]]
+
+
+def test_create_bilibili_upload_job_uses_source_video_when_outputs_missing(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.bilibili_uploads, "enqueue", enqueued.append)
+    task_id = database.create_task("https://www.youtube.com/watch?v=source01", task_id="source01")
+    session = tmp_path / "workfolder" / "Uploader" / "Title__source01"
+    media = session / "media"
+    media.mkdir(parents=True)
+    (media / "video_source.mp4").write_bytes(b"source")
+    database.update_task(
+        task_id,
+        status="succeeded",
+        session_path=str(session),
+        final_video_path=None,
+        completed_at=database.now_iso(),
+    )
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/bilibili-upload",
+        json={"title": "测试标题", "publish_mode": "now"},
+    )
+
+    assert response.status_code == 202
+    assert enqueued == [response.json()["id"]]
+
+
+def test_create_bilibili_upload_allows_non_succeeded_task_with_video(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.bilibili_uploads, "enqueue", enqueued.append)
+    task_id = database.create_task("https://www.youtube.com/watch?v=notdone12345", task_id="notdone12345")
+    session = tmp_path / "workfolder" / "Uploader" / "Title__notdone12345"
+    media = session / "media"
+    media.mkdir(parents=True)
+    (media / "video_source.mp4").write_bytes(b"source")
+    database.update_task(task_id, status="paused", session_path=str(session))
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/bilibili-upload",
+        json={"title": "测试标题", "publish_mode": "now"},
+    )
+
+    assert response.status_code == 202
+    assert enqueued == [response.json()["id"]]
 
 
 def test_create_bilibili_upload_requires_title(monkeypatch, tmp_path):
@@ -158,11 +220,13 @@ def test_bilibili_upload_worker_marks_success(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     task_id = _make_succeeded_task(tmp_path)
     job_id = database.create_bilibili_upload_job(task_id, title="标题", publish_mode="now")
-    database.save_bilibili_settings('{"WolfeyVGC":"狼叔,宝可梦,VGC"}')
+    database.save_bilibili_settings(
+        author_config_json='{"WolfeyVGC":{"tags":"狼叔,宝可梦,VGC","tid":201}}'
+    )
 
     def fake_upload(options):
         assert options.title == "标题"
-        assert options.author_tags_json == '{"WolfeyVGC":"狼叔,宝可梦,VGC"}'
+        assert options.author_config_json == '{"WolfeyVGC":{"tags":"狼叔,宝可梦,VGC","tid":201}}'
         return FakeUploadResult()
 
     import scripts.upload_bilibili as upload_script

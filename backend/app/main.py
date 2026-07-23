@@ -13,12 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from . import bilibili_uploads, database, watermark_masks, worker
+from . import bilibili_uploads, database, watermark_masks, worker, youtube_channel_monitor
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
 from .adapters.openai_translate import list_models as list_openai_models
+from .adapters.openai_translate import translate_title_to_chinese
 from .config import WORKFOLDER, YOUTUBE_COOKIE_PATH, ensure_runtime_dirs
-from .pipeline import run_task
+from .cut_intervals import default_cut_intervals, serialize_cut_intervals
+from .pipeline import PipelineRunner, run_task
 from .runtime_checks import validate_runtime_device
 from .sanitize import sanitize_text
 from .sources import detect_source
@@ -33,12 +35,38 @@ LOCAL_UPLOAD_CHUNK_SIZE = 1024 * 1024
 MAX_LOCAL_UPLOAD_BYTES = int(os.getenv("LOCAL_UPLOAD_MAX_BYTES", str(4 * 1024 * 1024 * 1024)))
 MAX_LOCAL_SUBTITLE_BYTES = int(os.getenv("LOCAL_SUBTITLE_MAX_BYTES", str(20 * 1024 * 1024)))
 MAX_BILIBILI_COVER_BYTES = int(os.getenv("BILIBILI_COVER_MAX_BYTES", str(20 * 1024 * 1024)))
+BILIBILI_UPLOAD_VIDEO_CANDIDATES = (
+    "video_final_trimmed.mp4",
+    "video_final_with_cta.mp4",
+    "video_final.mp4",
+    "video_source.mp4",
+)
 
 
 def mask_secret(value: str) -> str:
     if not value:
         return ""
     return "********"
+
+
+def bilibili_upload_video_path(session_path: str) -> Path | None:
+    if not session_path:
+        return None
+    media_dir = Path(session_path) / "media"
+    for name in BILIBILI_UPLOAD_VIDEO_CANDIDATES:
+        candidate = media_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def concat_input_video_path(session_path: str) -> Path | None:
+    media_dir = Path(session_path) / "media"
+    for name in ("video_final.mp4", "video_source.mp4"):
+        candidate = media_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 class TaskCreate(BaseModel):
@@ -51,6 +79,19 @@ class VideoLinkRecordCreate(BaseModel):
     url: str
 
 
+class YouTubeChannelMonitorCreate(BaseModel):
+    channel_url: str
+    enabled: bool = True
+    check_interval_minutes: int = youtube_channel_monitor.DEFAULT_CHECK_INTERVAL_MINUTES
+    latest_count: int = youtube_channel_monitor.DEFAULT_LATEST_COUNT
+
+
+class YouTubeChannelMonitorUpdate(BaseModel):
+    enabled: bool | None = None
+    check_interval_minutes: int | None = None
+    latest_count: int | None = None
+
+
 class ContinueTaskRequest(BaseModel):
     execution_mode: str | None = None
 
@@ -59,6 +100,10 @@ class BilibiliUploadRequest(BaseModel):
     title: str
     publish_mode: str = "now"
     dtime: str | None = None
+
+
+class BilibiliTitleTranslateRequest(BaseModel):
+    title: str | None = None
 
 
 class WatermarkMaskRequest(BaseModel):
@@ -96,7 +141,9 @@ class YtdlpSettingsUpdate(BaseModel):
 
 
 class BilibiliSettingsUpdate(BaseModel):
+    author_config_json: str = ""
     author_tags_json: str = ""
+    author_tids_json: str = ""
 
 
 class MailSettingsUpdate(BaseModel):
@@ -206,7 +253,7 @@ def task_cut_intervals(task: dict) -> list[dict[str, float]]:
             return normalize_cut_intervals([CutInterval(**item) for item in _json.loads(intervals_file.read_text(encoding="utf-8"))])
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=500, detail="cut_intervals.json is invalid.") from exc
-    return []
+    return default_cut_intervals()
 
 
 def normalize_translate_concurrency(value: str) -> str:
@@ -243,6 +290,65 @@ def normalize_bilibili_author_tags_json(value: str) -> str:
     return _json.dumps(normalized, ensure_ascii=False)
 
 
+def normalize_bilibili_author_tids_json(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    try:
+        parsed = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"Bilibili author tids must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=422, detail="Bilibili author tids must be a JSON object.")
+    normalized: dict[str, int] = {}
+    for author, tid in parsed.items():
+        if not isinstance(author, str):
+            raise HTTPException(status_code=422, detail="Bilibili author tids keys must be strings.")
+        if isinstance(tid, bool) or not isinstance(tid, int):
+            raise HTTPException(status_code=422, detail="Bilibili author tids values must be integer category IDs.")
+        if tid <= 0:
+            raise HTTPException(status_code=422, detail="Bilibili author tids values must be greater than 0.")
+        key = author.strip()
+        if key:
+            normalized[key] = tid
+    return _json.dumps(normalized, ensure_ascii=False)
+
+
+def normalize_bilibili_author_config_json(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    try:
+        parsed = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"Bilibili author config must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=422, detail="Bilibili author config must be a JSON object.")
+    normalized: dict[str, dict[str, str | int]] = {}
+    for author, profile in parsed.items():
+        if not isinstance(author, str):
+            raise HTTPException(status_code=422, detail="Bilibili author config keys must be strings.")
+        if not isinstance(profile, dict):
+            raise HTTPException(status_code=422, detail="Bilibili author config values must be objects.")
+        item: dict[str, str | int] = {}
+        if "tags" in profile:
+            tags = profile["tags"]
+            if not isinstance(tags, str):
+                raise HTTPException(status_code=422, detail="Bilibili author config tags values must be strings.")
+            item["tags"] = tags.strip()
+        if "tid" in profile:
+            tid = profile["tid"]
+            if isinstance(tid, bool) or not isinstance(tid, int):
+                raise HTTPException(status_code=422, detail="Bilibili author config tid values must be integer category IDs.")
+            if tid <= 0:
+                raise HTTPException(status_code=422, detail="Bilibili author config tid values must be greater than 0.")
+            item["tid"] = tid
+        key = author.strip()
+        if key:
+            normalized[key] = item
+    return _json.dumps(normalized, ensure_ascii=False)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_runtime_dirs()
@@ -254,6 +360,7 @@ async def lifespan(app: FastAPI):
     worker.start(run_task)
     bilibili_uploads.start()
     watermark_masks.start()
+    youtube_channel_monitor.start()
     yield
 
 
@@ -301,6 +408,8 @@ def _task_with_source(task: dict | None) -> dict | None:
         return None
     result = dict(task)
     result["auto_bilibili_upload"] = bool(result.get("auto_bilibili_upload"))
+    display_video = bilibili_upload_video_path(result.get("session_path") or "")
+    result["display_video_path"] = str(display_video) if display_video else None
     try:
         result["source_name"] = detect_source(result["url"]).name
     except ValueError:
@@ -314,6 +423,12 @@ def _video_link_record_with_source(record: dict) -> dict:
         result["source_name"] = detect_source(result["url"]).name
     except ValueError:
         result["source_name"] = "unknown"
+    return result
+
+
+def _youtube_channel_monitor_response(monitor: dict) -> dict:
+    result = dict(monitor)
+    result["enabled"] = bool(result.get("enabled"))
     return result
 
 
@@ -368,6 +483,90 @@ def delete_video_link_record(record_id: str) -> Response:
     if not database.delete_video_link_record(record_id):
         raise HTTPException(status_code=404, detail="Video link record not found.")
     return Response(status_code=204)
+
+
+def normalize_monitor_interval(value: int | None) -> int:
+    try:
+        return youtube_channel_monitor.normalize_check_interval_minutes(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def normalize_monitor_latest_count(value: int | None) -> int:
+    try:
+        return youtube_channel_monitor.normalize_latest_count(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/youtube-channel-monitors")
+def list_youtube_channel_monitors() -> dict:
+    return {
+        "monitors": [
+            _youtube_channel_monitor_response(monitor)
+            for monitor in database.list_youtube_channel_monitors()
+        ]
+    }
+
+
+@app.post("/api/youtube-channel-monitors", status_code=201)
+def create_youtube_channel_monitor(payload: YouTubeChannelMonitorCreate) -> dict:
+    try:
+        channel = youtube_channel_monitor.resolve_channel_info(payload.channel_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to resolve YouTube channel: {exc}") from exc
+
+    monitor = database.create_youtube_channel_monitor(
+        channel_url=channel.channel_url,
+        channel_id=channel.channel_id,
+        title=channel.title,
+        enabled=payload.enabled,
+        check_interval_minutes=normalize_monitor_interval(payload.check_interval_minutes),
+        latest_count=normalize_monitor_latest_count(payload.latest_count),
+    )
+    try:
+        youtube_channel_monitor.seed_monitor_seen(monitor)
+    except Exception as exc:
+        database.update_youtube_channel_monitor_check(monitor["id"], last_error=str(exc))
+    return _youtube_channel_monitor_response(database.get_youtube_channel_monitor(monitor["id"]) or monitor)
+
+
+@app.patch("/api/youtube-channel-monitors/{monitor_id}")
+def update_youtube_channel_monitor(monitor_id: str, payload: YouTubeChannelMonitorUpdate) -> dict:
+    if not database.get_youtube_channel_monitor(monitor_id):
+        raise HTTPException(status_code=404, detail="YouTube channel monitor not found.")
+    fields: dict[str, object] = {}
+    if payload.enabled is not None:
+        fields["enabled"] = 1 if payload.enabled else 0
+    if payload.check_interval_minutes is not None:
+        fields["check_interval_minutes"] = normalize_monitor_interval(payload.check_interval_minutes)
+    if payload.latest_count is not None:
+        fields["latest_count"] = normalize_monitor_latest_count(payload.latest_count)
+    monitor = database.update_youtube_channel_monitor(monitor_id, **fields)
+    return _youtube_channel_monitor_response(monitor)
+
+
+@app.delete("/api/youtube-channel-monitors/{monitor_id}", status_code=204)
+def delete_youtube_channel_monitor(monitor_id: str) -> Response:
+    if not database.delete_youtube_channel_monitor(monitor_id):
+        raise HTTPException(status_code=404, detail="YouTube channel monitor not found.")
+    return Response(status_code=204)
+
+
+@app.post("/api/youtube-channel-monitors/{monitor_id}/check")
+def check_youtube_channel_monitor(monitor_id: str) -> dict:
+    monitor = database.get_youtube_channel_monitor(monitor_id)
+    if not monitor:
+        raise HTTPException(status_code=404, detail="YouTube channel monitor not found.")
+    try:
+        result = youtube_channel_monitor.check_monitor(monitor)
+    except Exception as exc:
+        database.update_youtube_channel_monitor_check(monitor_id, last_error=str(exc))
+        raise HTTPException(status_code=502, detail=f"Failed to check YouTube channel: {exc}") from exc
+    updated = database.get_youtube_channel_monitor(monitor_id) or monitor
+    return {"monitor": _youtube_channel_monitor_response(updated), **result}
 
 
 @app.post("/api/tasks", status_code=201)
@@ -637,13 +836,15 @@ def trim_video_task(task_id: str, payload: CutIntervalsRequest | None = None) ->
 
     if payload is not None:
         intervals = normalize_cut_intervals(payload.cut_intervals)
-        serialized = _json.dumps(intervals, ensure_ascii=False)
+        serialized = serialize_cut_intervals(intervals)
         database.save_task_cut_intervals(task_id, serialized)
         intervals_file.write_text(serialized, encoding="utf-8")
     else:
         intervals = task_cut_intervals(task)
         if intervals:
-            intervals_file.write_text(_json.dumps(intervals, ensure_ascii=False), encoding="utf-8")
+            serialized = serialize_cut_intervals(intervals)
+            database.save_task_cut_intervals(task_id, serialized)
+            intervals_file.write_text(serialized, encoding="utf-8")
 
     if not intervals_file.exists():
         raise HTTPException(status_code=400, detail="No cut intervals provided and cut_intervals.json not found.")
@@ -659,6 +860,56 @@ def trim_video_task(task_id: str, payload: CutIntervalsRequest | None = None) ->
     return _task_with_source(database.get_task(task_id))
 
 
+@app.post("/api/tasks/{task_id}/concat")
+def concat_video_task(task_id: str) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task["status"] in {"running", "queued"}:
+        raise HTTPException(status_code=409, detail="Task is already running or queued.")
+    session_path = task.get("session_path")
+    if not session_path:
+        raise HTTPException(status_code=400, detail="Task has no session path; run the pipeline first.")
+
+    session = Path(session_path)
+    input_video = concat_input_video_path(session_path)
+    if not input_video:
+        raise HTTPException(status_code=400, detail="Task has no final or source video to concatenate.")
+
+    _ensure_runtime_ready()
+    source = detect_source(task["url"])
+    remove_stage_artifacts(session, "concat_video", source)
+    database.update_stage(
+        task_id,
+        "trim_video",
+        status="pending",
+        progress=None,
+        started_at=None,
+        completed_at=None,
+        error_message=None,
+        last_message=None,
+    )
+    try:
+        runner = PipelineRunner(task_id)
+        runner.artifacts.session = session
+        runner._run_stage("concat_video")
+        concatenated = runner.artifacts.concatenated_video
+        if not concatenated:
+            raise RuntimeError("Concat stage did not produce a video.")
+        database.update_task(task_id, final_video_path=str(concatenated))
+    except Exception as exc:
+        database.update_stage(
+            task_id,
+            "concat_video",
+            status="failed",
+            completed_at=database.now_iso(),
+            error_message=str(exc),
+            last_message="Failed",
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return _task_with_source(database.get_task(task_id))
+
+
 def _normalize_bilibili_publish_mode(value: str) -> str:
     mode = value.strip().lower()
     if mode not in {"now", "scheduled"}:
@@ -671,6 +922,24 @@ def _normalize_watermark_mask_mode(value: str) -> str:
     if mode not in {"patch", "blur"}:
         raise HTTPException(status_code=422, detail="mode must be one of: patch, blur")
     return mode
+
+
+@app.post("/api/tasks/{task_id}/bilibili-title/translate")
+def translate_bilibili_title(task_id: str, payload: BilibiliTitleTranslateRequest) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    title = (payload.title or task.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Title is required.")
+    settings = database.get_openai_settings()
+    try:
+        translated = translate_title_to_chinese(title, **{key: settings[key] for key in ("base_url", "api_key", "model")})
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to translate title: {exc}") from exc
+    return {"title": translated}
 
 
 @app.post("/api/tasks/{task_id}/bilibili-upload", status_code=202)
@@ -696,13 +965,11 @@ async def create_bilibili_upload(task_id: str, request: Request) -> dict:
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
-    if task["status"] != "succeeded":
-        raise HTTPException(status_code=409, detail="Only succeeded tasks can be published to Bilibili.")
     session_path = task.get("session_path")
     if not session_path:
         raise HTTPException(status_code=400, detail="Task has no session path; run the pipeline first.")
-    final_path = task.get("final_video_path")
-    if not final_path or not Path(final_path).exists():
+    final_path = bilibili_upload_video_path(session_path)
+    if not final_path:
         raise HTTPException(status_code=404, detail="Final video is not available.")
 
     title = payload.title.strip()
@@ -867,8 +1134,9 @@ def final_video(task_id: str, download: bool = False) -> FileResponse:
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
-    final_path = task.get("final_video_path")
-    if not final_path or not Path(final_path).exists():
+    session_path = task.get("session_path")
+    final_path = bilibili_upload_video_path(session_path) if session_path else None
+    if not final_path:
         raise HTTPException(status_code=404, detail="Final video is not available.")
     name = Path(final_path).name
     if download:
@@ -952,7 +1220,11 @@ def get_bilibili_settings() -> dict:
 
 @app.post("/api/settings/bilibili")
 def save_bilibili_settings(payload: BilibiliSettingsUpdate) -> dict:
-    database.save_bilibili_settings(normalize_bilibili_author_tags_json(payload.author_tags_json))
+    database.save_bilibili_settings(
+        normalize_bilibili_author_tags_json(payload.author_tags_json),
+        normalize_bilibili_author_tids_json(payload.author_tids_json),
+        author_config_json=normalize_bilibili_author_config_json(payload.author_config_json),
+    )
     return get_bilibili_settings()
 
 

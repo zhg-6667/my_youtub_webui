@@ -76,3 +76,7 @@ def detect_source(url: str) -> SourceConfig:
         if source.matches(url):
             return source
     raise ValueError(f"No source matches URL: {url}")
+
+
+def should_skip_cta_concat(source: SourceConfig) -> bool:
+    return source.asr_language == "zh" and source.target_language == "en"

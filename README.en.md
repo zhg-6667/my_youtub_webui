@@ -220,6 +220,7 @@ Common environment variables:
 | `LOCAL_UPLOAD_MAX_BYTES` | Maximum local video upload size. Default: 4 GiB. |
 | `LOCAL_SUBTITLE_MAX_BYTES` | Maximum optional local SRT subtitle upload size. Default: 20 MiB. |
 | `BILIBILI_COVER_MAX_BYTES` | Maximum custom Bilibili cover upload size. Default: 20 MiB. |
+| `BILIBILI_AUTHOR_CONFIG_JSON` | JSON map from source author to upload config, for example `{"WolfeyVGC":{"tags":"WolfeyVGC,VGC","tid":17}}`. Missing category IDs use 17 (standalone games). Can also be maintained from Settings. |
 | `YTDLP_PROXY_PORT` | Local proxy port used by yt-dlp, for example `7890`. |
 | `MAIL_ENABLED` | Enable task success/failure email notifications. Default: `false`; can also be maintained from Settings. |
 | `MAIL_SMTP_HOST` / `MAIL_SMTP_PORT` | SMTP server host and port. Default port: `587`. |

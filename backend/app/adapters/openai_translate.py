@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,10 @@ class PreprocessResponse(BaseModel):
 
 class TranslationItem(BaseModel):
     dst: str
+
+
+class TitleTranslationResponse(BaseModel):
+    title: str
 
 
 def list_models(*, base_url: str, api_key: str) -> list[str]:
@@ -92,17 +96,42 @@ def _extract_json(raw: str) -> dict[str, Any] | list[Any]:
     raise json.JSONDecodeError(f"no JSON object found; raw[:300]={raw[:300]!r}", raw, 0)
 
 
-def _call_json(client: OpenAI, model: str, system: str, user: str) -> dict[str, Any]:
+def _call_json(client: OpenAI, model: str, system: str, user: str) -> dict[str, Any] | list[Any]:
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.2,
+        temperature=0,
+        response_format={"type": "json_object"},
     )
     raw = response.choices[0].message.content or "{}"
     return _extract_json(raw)
+
+
+def translate_title_to_chinese(title: str, *, base_url: str, api_key: str, model: str) -> str:
+    cleaned = title.strip()
+    if not cleaned:
+        raise ValueError("Title is required.")
+    client = _client(base_url, api_key)
+    payload = _call_json(
+        client,
+        model,
+        "You translate video titles into natural Simplified Chinese for Bilibili uploads. Return JSON only.",
+        (
+            "Translate this video title into concise, natural Simplified Chinese. "
+            "Preserve proper nouns, game names, player names, and official terms when appropriate. "
+            "Do not add brackets, prefixes, suffixes, emojis, explanations, or quotation marks.\n\n"
+            f"Title: {cleaned}\n\n"
+            'Return exactly: {"title":"中文标题"}'
+        ),
+    )
+    parsed = TitleTranslationResponse.model_validate(payload)
+    translated = parsed.title.strip()
+    if not translated:
+        raise ValueError("Translated title is empty.")
+    return translated
 
 
 def _format_terms(items: list, fmt: str, empty: str) -> str:
@@ -201,6 +230,25 @@ def _merge_clauses(parts: list[str], target_language: str) -> str:
     return joiner.join(part.strip() for part in parts if part.strip())
 
 
+def _plain_translation_from_raw(raw: str, target_language: str) -> str:
+    text = raw.strip()
+    if not text or text.startswith(("{", "[")):
+        return ""
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text).strip()
+    text = re.sub(r"^(?:译文|翻译|translation|answer)\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [re.sub(r"^\s*\d+[.)、]\s*", "", line).strip() for line in lines]
+    cleaned = _merge_clauses([line for line in lines if line], target_language)
+    if (
+        len(cleaned) >= 2
+        and cleaned[0] == cleaned[-1]
+        and cleaned[0] in {"'", '"', "“", "”", "‘", "’"}
+    ):
+        cleaned = cleaned[1:-1].strip()
+    return _post_process(cleaned, target_language)
+
+
 def _translate_chunk(
     texts: list[str],
     target_language: str,
@@ -223,6 +271,13 @@ def _translate_chunk(
                 raise ValueError("empty translation in batch")
             return cleaned
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            if len(texts) == 1 and isinstance(exc, json.JSONDecodeError):
+                plain = _plain_translation_from_raw(exc.doc, target_language)
+                if plain:
+                    log.warning(
+                        "translate chunk(size=1) accepted plain-text fallback after JSON parse failed"
+                    )
+                    return [plain]
             last_error = exc
             log.warning(
                 "translate chunk(size=%d) attempt %d failed: %s", len(texts), attempt + 1, exc
@@ -244,6 +299,45 @@ def _chunked(texts: list[str], size: int) -> list[list[str]]:
     return [texts[i : i + size] for i in range(0, len(texts), size)]
 
 
+def _chunked_indices(indices: list[int], size: int) -> list[list[int]]:
+    return [indices[i : i + size] for i in range(0, len(indices), size)]
+
+
+def translation_partial_path(session: Path, target_language: str) -> Path:
+    return session / "metadata" / f"translation.{target_language}.partial.json"
+
+
+def _load_translation_partial(path: Path, total: int) -> dict[int, str]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        log.warning("Ignoring invalid translation partial cache %s: %s", path, exc)
+        return {}
+    raw_items: Any = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(raw_items, dict):
+        log.warning("Ignoring translation partial cache with invalid shape: %s", path)
+        return {}
+    partial: dict[int, str] = {}
+    for key, value in raw_items.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < total and isinstance(value, str) and value.strip():
+            partial[index] = value
+    return partial
+
+
+def _write_translation_partial(path: Path, partial: dict[int, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"items": {str(index): text for index, text in sorted(partial.items())}}
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
 def translate_batch(
     texts: list[str],
     source: SourceConfig,
@@ -255,6 +349,7 @@ def translate_batch(
     model: str,
     concurrency: int = DEFAULT_CONCURRENCY,
     batch_size: int = BATCH_SIZE,
+    partial_file: Path | None = None,
 ) -> list[str]:
     if not texts:
         return []
@@ -278,6 +373,45 @@ def translate_batch(
             for text in chunk:
                 out.extend(_translate_chunk([text], target_language, client, model, system))
             return out
+
+    if partial_file is not None:
+        partial = _load_translation_partial(partial_file, len(texts))
+        missing = [index for index in range(len(texts)) if index not in partial]
+        if not missing:
+            log.info("translate_batch: reused %d cached translations from %s", len(texts), partial_file)
+            return [partial[index] for index in range(len(texts))]
+
+        log.info(
+            "translate_batch: reusing %d cached translations, translating %d missing",
+            len(partial), len(missing),
+        )
+        indexed_chunks = _chunked_indices(missing, max(1, batch_size))
+
+        def handle_indices(indices: list[int]) -> list[tuple[int, str]]:
+            translated = handle([texts[index] for index in indices])
+            return list(zip(indices, translated))
+
+        first_error: Exception | None = None
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+            futures = [pool.submit(handle_indices, indices) for indices in indexed_chunks]
+            for future in as_completed(futures):
+                try:
+                    pairs = future.result()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                    log.warning("translation chunk failed while partial cache is enabled: %s", exc)
+                    continue
+                for index, translated in pairs:
+                    partial[index] = translated
+                _write_translation_partial(partial_file, partial)
+        if first_error is not None:
+            raise first_error
+        if len(partial) != len(texts):
+            raise RuntimeError(
+                f"translation partial cache incomplete: {len(partial)} of {len(texts)} items"
+            )
+        return [partial[index] for index in range(len(texts))]
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         results = list(pool.map(handle, chunks))
@@ -361,7 +495,13 @@ def translate_asr(
     else:
         log.info("Reusing translation preprocess artifact from %s", preprocess_artifact_path(session))
     dst_list = translate_batch(
-        texts, source, meta, pre, **api, concurrency=_concurrency_from(settings)
+        texts,
+        source,
+        meta,
+        pre,
+        **api,
+        concurrency=_concurrency_from(settings),
+        partial_file=translation_partial_path(session, source.target_language),
     )
 
     translation = [

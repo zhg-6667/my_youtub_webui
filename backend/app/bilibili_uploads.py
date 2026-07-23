@@ -77,7 +77,9 @@ def _run_job(job_id: str) -> None:
                 title=job["title"],
                 dtime=job["dtime"],
                 cover=job.get("cover_path"),
+                author_config_json=bilibili_settings["author_config_json"],
                 author_tags_json=bilibili_settings["author_tags_json"],
+                author_tids_json=bilibili_settings["author_tids_json"],
             )
         )
     except UploadBilibiliError as exc:

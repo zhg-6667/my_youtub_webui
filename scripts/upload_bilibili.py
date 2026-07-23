@@ -4,8 +4,8 @@ r"""把 workfolder 下的本地化成片投稿到 B 站（基于 biliup-rs 命�
     python scripts/upload_bilibili.py <任务目录或视频路径> --title "中文标题" [可选项]
 
 位置参数既可以是任务目录（形如 ...__0n5Xs9XleLw），也可以直接是
-media/video_final_trimmed.mp4。传任务目录时优先使用 trimmed 成片，缺失则回退到
-media/video_final.mp4。标题（--title）必须手动给中文。
+media/video_final_trimmed.mp4。传任务目录时优先使用裁剪后成片，缺失则依次回退到
+拼接后视频、合成后视频、原始视频。标题（--title）必须手动给中文。
 简介、封面、来源、日期均从该任务的 metadata/ytdlp_info.json 自动生成。
 
 首次使用需先登录一次（cookie 存本地复用）：
@@ -22,11 +22,9 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 # 脚本固定约定
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,14 +32,17 @@ WOLFEY_TAGS = "狼叔,宝可梦,神奇宝贝,VGC,WolfeyVGC,对战游戏,Pokemon,
 DEFAULT_TAGS = {
     "WolfeyVGC": WOLFEY_TAGS,
 }
+AUTHOR_CONFIG_ENV = "BILIBILI_AUTHOR_CONFIG_JSON"
 AUTHOR_TAGS_ENV = "BILIBILI_AUTHOR_TAGS_JSON"
+AUTHOR_TIDS_ENV = "BILIBILI_AUTHOR_TIDS_JSON"
 DEFAULT_TID = 17  # 单机游戏
 COPYRIGHT_SELF = 1  # 自制
 VIDEO_NAME = "video_final_trimmed.mp4"
+CONCAT_VIDEO_NAME = "video_final_with_cta.mp4"
 FALLBACK_VIDEO_NAME = "video_final.mp4"
+SOURCE_VIDEO_NAME = "video_source.mp4"
+VIDEO_CANDIDATES = (VIDEO_NAME, CONCAT_VIDEO_NAME, FALLBACK_VIDEO_NAME, SOURCE_VIDEO_NAME)
 COVER_NAME = "cover.jpg"
-THUMB_URLS = "https://img.youtube.com/vi/{vid}/{quality}.jpg"
-THUMB_QUALITIES = ("maxresdefault", "hqdefault")
 
 
 class UploadBilibiliError(RuntimeError):
@@ -66,13 +67,15 @@ class UploadBilibiliOptions:
     path: str
     title: str
     tag: str | None = None
-    tid: int = DEFAULT_TID
+    tid: int | None = None
     cover: str | None = None
     desc: str | None = None
     dtime: str | None = None
     cookie: str | None = None
     biliup: str | None = None
+    author_config_json: str | None = None
     author_tags_json: str | None = None
+    author_tids_json: str | None = None
     dry_run: bool = False
 
 
@@ -116,13 +119,11 @@ def resolve_paths(raw: str) -> "tuple[Path, Path]":
         # media/video_final_trimmed.mp4 -> 任务目录是 video.parent.parent
         return p.parent.parent, p
     if p.is_dir():
-        preferred = p / "media" / VIDEO_NAME
-        if preferred.is_file():
-            return p, preferred
-        fallback = p / "media" / FALLBACK_VIDEO_NAME
-        if fallback.is_file():
-            return p, fallback
-        return p, preferred
+        for name in VIDEO_CANDIDATES:
+            candidate = p / "media" / name
+            if candidate.is_file():
+                return p, candidate
+        return p, p / "media" / VIDEO_NAME
     fail(f"路径不存在：{p}")
 
 
@@ -132,16 +133,6 @@ def load_metadata(task_dir: Path) -> dict:
         fail(f"找不到元数据文件：{meta}")
     with meta.open(encoding="utf-8") as f:
         return json.load(f)
-
-
-def extract_video_id(info: dict) -> str:
-    url = info.get("webpage_url") or info.get("original_url") or ""
-    qs = parse_qs(urlparse(url).query)
-    if qs.get("v"):
-        return qs["v"][0]
-    if info.get("id"):
-        return str(info["id"])
-    fail(f"无法从链接解析出视频 ID：{url!r}")
 
 
 def format_date(yyyymmdd: str) -> str:
@@ -190,22 +181,82 @@ def default_tags_for_author(author: str, raw_config: str | None = None) -> str:
     return author_tags_config(raw_config).get(author, "")
 
 
-def download_cover(vid: str, dest: Path) -> "Path | None":
-    """下载 YouTube 封面（maxres 失败回退 hq）到 dest，失败返回 None。"""
-    for quality in THUMB_QUALITIES:
-        url = THUMB_URLS.format(vid=vid, quality=quality)
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = resp.read()
-            if not data:
-                continue
-            dest.write_bytes(data)
-            print(f"[封面] 已下载 {quality}（{len(data)} 字节）-> {dest}")
-            return dest
-        except Exception as exc:  # noqa: BLE001 - 任一画质失败都继续尝试
-            print(f"[封面] {quality} 下载失败：{exc}")
-    return None
+def author_tids_config(raw_config: str | None = None) -> dict[str, int]:
+    raw = (raw_config if raw_config is not None else os.getenv(AUTHOR_TIDS_ENV, "")).strip()
+    if not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"{AUTHOR_TIDS_ENV} 不是有效 JSON：{exc}")
+    if not isinstance(loaded, dict):
+        fail(f"{AUTHOR_TIDS_ENV} 必须是作者到分区 ID 的 JSON 对象。")
+    configured: dict[str, int] = {}
+    for author, tid in loaded.items():
+        if not isinstance(author, str):
+            fail(f"{AUTHOR_TIDS_ENV} 的键必须是字符串。")
+        if isinstance(tid, bool) or not isinstance(tid, int):
+            fail(f"{AUTHOR_TIDS_ENV} 的值必须是整数分区 ID。")
+        if tid <= 0:
+            fail(f"{AUTHOR_TIDS_ENV} 的分区 ID 必须大于 0。")
+        key = author.strip()
+        if key:
+            configured[key] = tid
+    return configured
+
+
+def default_tid_for_author(author: str, raw_config: str | None = None) -> int:
+    if not author:
+        return DEFAULT_TID
+    return author_tids_config(raw_config).get(author, DEFAULT_TID)
+
+
+def author_upload_config(
+    raw_config: str | None = None,
+    *,
+    legacy_tags_json: str | None = None,
+    legacy_tids_json: str | None = None,
+) -> dict[str, dict[str, str | int]]:
+    configured: dict[str, dict[str, str | int]] = {
+        author: {"tags": tags} for author, tags in DEFAULT_TAGS.items()
+    }
+    for author, tags in author_tags_config(legacy_tags_json).items():
+        configured.setdefault(author, {})["tags"] = tags
+    for author, tid in author_tids_config(legacy_tids_json).items():
+        configured.setdefault(author, {})["tid"] = tid
+
+    raw = (raw_config if raw_config is not None else os.getenv(AUTHOR_CONFIG_ENV, "")).strip()
+    if not raw:
+        return configured
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"{AUTHOR_CONFIG_ENV} 不是有效 JSON：{exc}")
+    if not isinstance(loaded, dict):
+        fail(f"{AUTHOR_CONFIG_ENV} 必须是作者到投稿配置的 JSON 对象。")
+    for author, profile in loaded.items():
+        if not isinstance(author, str):
+            fail(f"{AUTHOR_CONFIG_ENV} 的键必须是字符串。")
+        if not isinstance(profile, dict):
+            fail(f"{AUTHOR_CONFIG_ENV} 的值必须是包含 tags/tid 的对象。")
+        key = author.strip()
+        if not key:
+            continue
+        normalized: dict[str, str | int] = {}
+        if "tags" in profile:
+            tags = profile["tags"]
+            if not isinstance(tags, str):
+                fail(f"{AUTHOR_CONFIG_ENV} 中 tags 必须是字符串。")
+            normalized["tags"] = tags.strip()
+        if "tid" in profile:
+            tid = profile["tid"]
+            if isinstance(tid, bool) or not isinstance(tid, int):
+                fail(f"{AUTHOR_CONFIG_ENV} 中 tid 必须是整数分区 ID。")
+            if tid <= 0:
+                fail(f"{AUTHOR_CONFIG_ENV} 中 tid 必须大于 0。")
+            normalized["tid"] = tid
+        configured[key] = {**configured.get(key, {}), **normalized}
+    return configured
 
 
 def find_biliup(explicit: "str | None") -> str:
@@ -264,16 +315,22 @@ def build_upload_command(options: UploadBilibiliOptions) -> PreparedBilibiliUplo
         fail(f"找不到视频文件：{video}")
 
     info = load_metadata(task_dir)
-    vid = extract_video_id(info)
     desc = options.desc if options.desc is not None else build_desc(info)
     dtime = parse_dtime(options.dtime) if options.dtime else None
 
     # 标题自动包装：【中配】<正文><作者名>，例如 【中配】最弱的草系宝可梦是谁？WolfeyVGC
     author = author_name(info)
-    title = f"【中配】{title_input}{author}"
-    tag = options.tag if options.tag is not None else default_tags_for_author(author, options.author_tags_json)
+    title = f"{title_input}{author}"
+    author_profiles = author_upload_config(
+        options.author_config_json,
+        legacy_tags_json=options.author_tags_json,
+        legacy_tids_json=options.author_tids_json,
+    )
+    author_profile = author_profiles.get(author, {})
+    tag = options.tag if options.tag is not None else str(author_profile.get("tags") or "")
+    tid = options.tid if options.tid is not None else int(author_profile.get("tid") or DEFAULT_TID)
 
-    # 封面：优先用户指定，否则下载 YouTube 缩略图到任务目录
+    # 封面：优先用户指定，否则复用下载阶段写入任务目录的封面。
     cover_path = ""
     if options.cover:
         cp = Path(options.cover).expanduser().resolve()
@@ -281,11 +338,11 @@ def build_upload_command(options: UploadBilibiliOptions) -> PreparedBilibiliUplo
             fail(f"指定的封面不存在：{cp}")
         cover_path = str(cp)
     else:
-        got = download_cover(vid, task_dir / COVER_NAME)
-        if got:
-            cover_path = str(got)
+        cached_cover = task_dir / COVER_NAME
+        if cached_cover.exists() and cached_cover.stat().st_size > 0:
+            cover_path = str(cached_cover)
         else:
-            print("[封面] 下载失败，跳过封面，交给 biliup 自动截帧")
+            print("[封面] 未找到下载阶段生成的封面，跳过封面，交给 biliup 自动截帧")
 
     biliup = find_biliup(options.biliup)
     cookie = Path(options.cookie).resolve() if options.cookie else PROJECT_ROOT / "cookies.json"
@@ -298,7 +355,7 @@ def build_upload_command(options: UploadBilibiliOptions) -> PreparedBilibiliUplo
         "--title", title,
         "--desc", desc,
         "--tag", tag,
-        "--tid", str(options.tid),
+        "--tid", str(tid),
     ]
     if cover_path:
         cmd += ["--cover", cover_path]
@@ -313,7 +370,7 @@ def build_upload_command(options: UploadBilibiliOptions) -> PreparedBilibiliUplo
         title=title,
         desc=desc,
         tag=tag,
-        tid=options.tid,
+        tid=tid,
         cover_path=cover_path,
         dtime=dtime,
         raw_dtime=options.dtime,
@@ -391,7 +448,7 @@ def main() -> None:
             f"{AUTHOR_TAGS_ENV} 匹配，未匹配则为空"
         ),
     )
-    parser.add_argument("--tid", type=int, default=DEFAULT_TID, help=f"投稿分区，默认 {DEFAULT_TID}")
+    parser.add_argument("--tid", type=int, default=None, help=f"投稿分区；不传时按作者配置选择，默认 {DEFAULT_TID}")
     parser.add_argument("--cover", help="自定义封面图路径（给了就不从 YouTube 下载）")
     parser.add_argument("--desc", help="自定义简介（给了就不按模板自动生成）")
     parser.add_argument("--dtime", help="定时发布时间，如 '2026-07-01 18:00' 或 10 位 Unix 时间戳")
@@ -410,7 +467,9 @@ def main() -> None:
         dtime=args.dtime,
         cookie=args.cookie,
         biliup=args.biliup,
+        author_config_json=os.getenv(AUTHOR_CONFIG_ENV, ""),
         author_tags_json=os.getenv(AUTHOR_TAGS_ENV, ""),
+        author_tids_json=os.getenv(AUTHOR_TIDS_ENV, ""),
         dry_run=args.dry_run,
     )
 

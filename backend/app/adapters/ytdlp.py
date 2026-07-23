@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import time
 
@@ -12,7 +13,7 @@ import yt_dlp
 
 from ..sanitize import sanitize_text
 from ..sources import SourceConfig
-from ..youtube import extract_video_id
+from ..youtube import extract_video_id, is_youtube_url
 
 
 FORMAT_CANDIDATES = (
@@ -21,6 +22,10 @@ FORMAT_CANDIDATES = (
     "bv*+ba/b",
     "best",
 )
+
+COVER_NAME = "cover.jpg"
+THUMB_URLS = "https://img.youtube.com/vi/{vid}/{quality}.jpg"
+THUMB_QUALITIES = ("maxresdefault", "hqdefault")
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -99,6 +104,80 @@ def _remove_partial_outputs(video_file: Path) -> None:
             candidate.unlink(missing_ok=True)
 
 
+def _thumbnail_candidates(info: dict[str, Any], video_id: str) -> list[str]:
+    urls: list[str] = []
+    original_url = str(info.get("webpage_url") or info.get("original_url") or "")
+    if is_youtube_url(original_url):
+        for quality in THUMB_QUALITIES:
+            urls.append(THUMB_URLS.format(vid=video_id, quality=quality))
+
+    thumbnails = info.get("thumbnails") or []
+    if isinstance(thumbnails, list):
+        def score(item: Any) -> tuple[int, int]:
+            if not isinstance(item, dict):
+                return (0, 0)
+            preference = item.get("preference")
+            area = int(item.get("width") or 0) * int(item.get("height") or 0)
+            return (int(preference) if isinstance(preference, int) else 0, area)
+
+        for item in sorted(thumbnails, key=score, reverse=True):
+            if isinstance(item, dict) and isinstance(item.get("url"), str):
+                urls.append(item["url"])
+
+    thumbnail = info.get("thumbnail")
+    if isinstance(thumbnail, str):
+        urls.append(thumbnail)
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for url in urls:
+        if not url or url in seen:
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        seen.add(url)
+        deduped.append(url)
+    return deduped
+
+
+def _download_cover_from_info(
+    info: dict[str, Any],
+    dest: Path,
+    *,
+    source: SourceConfig,
+    proxy_port: str,
+) -> Path | None:
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+
+    video_id = str(info.get("id") or "")
+    proxies = None
+    if source.use_proxy:
+        proxy = _proxy_url(proxy_port)
+        if proxy:
+            proxies = {"http": proxy, "https": proxy}
+
+    for url in _thumbnail_candidates(info, video_id):
+        try:
+            response = requests.get(
+                url,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+                timeout=30,
+                proxies=proxies,
+            )
+            response.raise_for_status()
+            if not response.content:
+                continue
+            dest.write_bytes(response.content)
+            return dest
+        except requests.RequestException:
+            continue
+        except OSError:
+            return None
+    return None
+
+
 def _download_with_format_candidates(
     url: str, video_file: Path, source: SourceConfig, proxy_port: str
 ) -> None:
@@ -144,8 +223,10 @@ def download_video(
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
     video_file = media_dir / "video_source.mp4"
+    cover_file = session / COVER_NAME
     metadata_file = metadata_dir / "ytdlp_info.json"
     metadata_file.write_text(json.dumps(ydl.sanitize_info(info), ensure_ascii=False, indent=2), encoding="utf-8")
+    _download_cover_from_info(info, cover_file, source=source, proxy_port=proxy_port)
 
     if video_file.exists() and video_file.stat().st_size > 0:
         return session, info

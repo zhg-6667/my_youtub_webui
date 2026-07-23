@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -213,6 +214,23 @@ def test_translate_batch_uses_shared_system_prompt(monkeypatch):
     assert len(captured) == 3, "5 sentences with batch_size=2 must use 3 requests, not 5"
 
 
+def test_call_json_requests_json_mode():
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"items": ["ok"]}'))]
+        )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+
+    out = openai_translate._call_json(client, "m", "sys", "user")
+    assert out == {"items": ["ok"]}
+    assert captured["response_format"] == {"type": "json_object"}
+    assert captured["temperature"] == 0
+
+
 @pytest.mark.parametrize("value", ["abc", "1.5", "0", "-1", "201", ""])
 def test_concurrency_from_bad_saved_values_falls_back_to_default(value):
     assert openai_translate._concurrency_from({"translate_concurrency": value}) == 50
@@ -230,6 +248,20 @@ def test_translate_sentence_retries_on_empty_dst(monkeypatch):
     out = openai_translate.translate_sentence("hello", "en", object(), "m", "sys")
     assert out == "ok"
     assert calls["n"] == 2
+
+
+def test_translate_sentence_accepts_plain_text_when_json_missing(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_call_json(client, model, system, user):
+        calls["n"] += 1
+        raise json.JSONDecodeError("no JSON object found", "1. 我成功用出了威吓。", 0)
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+
+    out = openai_translate.translate_sentence("I got Intimidate off.", "zh", object(), "m", "sys")
+    assert out == "我成功用出了威吓。"
+    assert calls["n"] == 1
 
 
 def test_translate_sentence_raises_after_retries(monkeypatch):
@@ -313,6 +345,25 @@ def test_translate_batch_falls_back_to_per_sentence_when_batch_misaligns(monkeyp
     assert out == ["solo:a", "solo:b", "solo:c"]
 
 
+def test_translate_batch_per_sentence_fallback_accepts_plain_text(monkeypatch):
+    def fake_call_json(client, model, system, user):
+        lines = user.strip().split("\n")
+        if len(lines) > 1:
+            return {"items": ["only-one"]}
+        text = lines[0].split(". ", 1)[1]
+        raise json.JSONDecodeError("no JSON object found", f"1. solo:{text}", 0)
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    texts = ["a", "b", "c"]
+    out = openai_translate.translate_batch(
+        texts, BB_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", batch_size=3,
+    )
+    assert out == ["solo:a", "solo:b", "solo:c"]
+
+
 def test_translate_chunk_merges_single_sentence_split_into_clauses_zh(monkeypatch):
     monkeypatch.setattr(
         openai_translate, "_call_json", lambda *a, **kw: {"items": ["前半句，", "后半句。"]}
@@ -348,3 +399,83 @@ def test_translate_batch_accepts_top_level_json_array(monkeypatch):
 def test_extract_json_parses_bare_and_noisy_arrays():
     assert openai_translate._extract_json('["x", "y"]') == ["x", "y"]
     assert openai_translate._extract_json('结果：\n["x", "y"]\ndone') == ["x", "y"]
+
+
+def test_translate_batch_writes_and_reuses_partial_cache(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_call_json(client, model, system, user):
+        lines = user.strip().split("\n")
+        texts = [line.split(". ", 1)[1] for line in lines]
+        calls.append(texts)
+        return {"items": [f"zh:{text}" for text in texts]}
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    partial = tmp_path / "translation.zh.partial.json"
+    texts = ["a", "b", "c", "d", "e"]
+    out = openai_translate.translate_batch(
+        texts,
+        YT_SOURCE,
+        {},
+        PreprocessResponse(),
+        base_url="u",
+        api_key="k",
+        model="m",
+        concurrency=1,
+        batch_size=2,
+        partial_file=partial,
+    )
+    assert out == [f"zh:{text}" for text in texts]
+    assert calls == [["a", "b"], ["c", "d"], ["e"]]
+    saved = json.loads(partial.read_text(encoding="utf-8"))
+    assert saved["items"] == {str(i): f"zh:{text}" for i, text in enumerate(texts)}
+
+    def fail_call_json(*args, **kwargs):
+        raise AssertionError("cached translations should avoid API calls")
+
+    monkeypatch.setattr(openai_translate, "_call_json", fail_call_json)
+    cached = openai_translate.translate_batch(
+        texts,
+        YT_SOURCE,
+        {},
+        PreprocessResponse(),
+        base_url="u",
+        api_key="k",
+        model="m",
+        concurrency=1,
+        batch_size=2,
+        partial_file=partial,
+    )
+    assert cached == out
+
+
+def test_translate_asr_resumes_from_partial_cache(tmp_path, monkeypatch):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    asr_file = metadata / "asr_fixed.json"
+    _write_asr(asr_file, 3)
+    (metadata / "translation_preprocess.json").write_text(
+        json.dumps({"summary": "cached", "hotwords": [], "corrections": []}),
+        encoding="utf-8",
+    )
+    (metadata / "translation.zh.partial.json").write_text(
+        json.dumps({"items": {"0": "cached:S0."}}),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_call_json(client, model, system, user):
+        lines = user.strip().split("\n")
+        texts = [line.split(". ", 1)[1] for line in lines]
+        calls.append(texts)
+        return {"items": [f"zh:{text}" for text in texts]}
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    out = openai_translate.translate_asr(asr_file, tmp_path, _settings(), YT_SOURCE)
+    items = json.loads(out.read_text(encoding="utf-8"))["translation"]
+    assert [item["dst"] for item in items] == ["cached:S0.", "zh:S1.", "zh:S2."]
+    assert calls == [["S1.", "S2."]]

@@ -220,6 +220,7 @@ cp env.txt.example .env
 | `LOCAL_UPLOAD_MAX_BYTES` | 本地视频上传大小上限，默认 4 GiB。 |
 | `LOCAL_SUBTITLE_MAX_BYTES` | 可选本地 SRT 字幕上传大小上限，默认 20 MiB。 |
 | `BILIBILI_COVER_MAX_BYTES` | B 站投稿自定义封面上传大小上限，默认 20 MiB。 |
+| `BILIBILI_AUTHOR_CONFIG_JSON` | B 站投稿作者配置，例如 `{"WolfeyVGC":{"tags":"狼叔,宝可梦,VGC","tid":17}}`；未命中分区默认 17（单机游戏）。也可在设置弹窗中维护。 |
 | `YTDLP_PROXY_PORT` | yt-dlp 使用的本机代理端口，例如 `7890`。 |
 | `MAIL_ENABLED` | 是否启用任务完成/失败邮件通知，默认 `false`；也可在设置弹窗中维护。 |
 | `MAIL_SMTP_HOST` / `MAIL_SMTP_PORT` | SMTP 服务器地址和端口，默认端口 `587`。 |

@@ -10,6 +10,9 @@ function apiProxyTarget() {
 
 const nextConfig: NextConfig = {
   allowedDevOrigins: ["172.27.2.90", "100.94.222.54"],
+  experimental: {
+    proxyClientMaxBodySize: "4gb",
+  },
   async rewrites() {
     return [
       {

@@ -6,7 +6,7 @@ import re
 import pytest
 from fastapi.testclient import TestClient
 
-from backend.app import config, database
+from backend.app import config, database, youtube_channel_monitor
 from backend.app import main
 from backend.app import worker
 
@@ -167,6 +167,129 @@ def test_video_link_records_can_be_saved_listed_and_deleted(monkeypatch, tmp_pat
     assert client.get("/api/video-links").json()["video_links"] == []
 
 
+def test_video_link_records_include_duration(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    database.upsert_video_link_record(
+        "https://www.youtube.com/watch?v=duration001",
+        record_id="duration001",
+        duration_seconds=625,
+    )
+    client = TestClient(main.app)
+
+    listed = client.get("/api/video-links")
+
+    assert listed.status_code == 200
+    assert listed.json()["video_links"][0]["duration_seconds"] == 625
+
+
+def test_youtube_channel_monitor_adds_new_videos_with_duration(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    feed_calls = 0
+
+    def fake_resolve(channel_url: str) -> youtube_channel_monitor.ChannelInfo:
+        return youtube_channel_monitor.ChannelInfo(
+            channel_id="UCtestchannel",
+            title="WolfeyVGC",
+            channel_url="https://www.youtube.com/channel/UCtestchannel",
+        )
+
+    def fake_feed(channel_id: str, limit: int) -> list[youtube_channel_monitor.FeedEntry]:
+        nonlocal feed_calls
+        feed_calls += 1
+        if feed_calls == 1:
+            return [
+                youtube_channel_monitor.FeedEntry(
+                    video_id="oldvideo001",
+                    url="https://www.youtube.com/watch?v=oldvideo001",
+                    title="Old 1",
+                    published_at="2026-07-16T00:00:00+00:00",
+                ),
+                youtube_channel_monitor.FeedEntry(
+                    video_id="oldvideo002",
+                    url="https://www.youtube.com/watch?v=oldvideo002",
+                    title="Old 2",
+                    published_at="2026-07-15T00:00:00+00:00",
+                ),
+            ][:limit]
+        return [
+            youtube_channel_monitor.FeedEntry(
+                video_id="newvideo001",
+                url="https://www.youtube.com/watch?v=newvideo001",
+                title="New",
+                published_at="2026-07-17T00:00:00+00:00",
+            ),
+            youtube_channel_monitor.FeedEntry(
+                video_id="oldvideo001",
+                url="https://www.youtube.com/watch?v=oldvideo001",
+                title="Old 1",
+                published_at="2026-07-16T00:00:00+00:00",
+            ),
+        ][:limit]
+
+    monkeypatch.setattr(main.youtube_channel_monitor, "resolve_channel_info", fake_resolve)
+    monkeypatch.setattr(main.youtube_channel_monitor, "fetch_channel_feed", fake_feed)
+    monkeypatch.setattr(main.youtube_channel_monitor, "fetch_video_duration_seconds", lambda url: 742)
+    client = TestClient(main.app)
+
+    created = client.post(
+        "/api/youtube-channel-monitors",
+        json={"channel_url": "https://www.youtube.com/@WolfeyVGC/videos"},
+    )
+    assert created.status_code == 201
+    assert client.get("/api/video-links").json()["video_links"] == []
+
+    checked = client.post(f"/api/youtube-channel-monitors/{created.json()['id']}/check")
+    links = client.get("/api/video-links").json()["video_links"]
+
+    assert checked.status_code == 200
+    assert checked.json()["added"] == 1
+    assert links[0]["id"] == "newvideo001"
+    assert links[0]["duration_seconds"] == 742
+
+
+def test_translate_bilibili_title_uses_ai_settings(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    database.save_openai_settings("https://example.com/v1", "sk-test", "test-model")
+    task_id = database.create_task("https://www.youtube.com/watch?v=titletran01", task_id="titletran01")
+    database.update_task(task_id, title="How I Won the World Championship")
+    calls: list[dict] = []
+
+    def fake_translate(title: str, **settings):
+        calls.append({"title": title, **settings})
+        return "我是如何赢得世界冠军的"
+
+    monkeypatch.setattr(main, "translate_title_to_chinese", fake_translate)
+    client = TestClient(main.app)
+
+    response = client.post(f"/api/tasks/{task_id}/bilibili-title/translate", json={})
+
+    assert response.status_code == 200
+    assert response.json() == {"title": "我是如何赢得世界冠军的"}
+    assert calls == [
+        {
+            "title": "How I Won the World Championship",
+            "base_url": "https://example.com/v1",
+            "api_key": "sk-test",
+            "model": "test-model",
+        }
+    ]
+
+
+def test_translate_bilibili_title_accepts_input_override(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=titletran02", task_id="titletran02")
+    monkeypatch.setattr(main, "translate_title_to_chinese", lambda title, **settings: f"中文：{title}")
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/bilibili-title/translate",
+        json={"title": "Custom English Title"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"title": "中文：Custom English Title"}
+
+
 def test_video_link_record_tracks_created_task(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     monkeypatch.setattr(main.worker, "enqueue", lambda task_id: None)
@@ -251,6 +374,40 @@ def test_task_detail_includes_stage_progress(monkeypatch, tmp_path):
     stages = {stage["name"]: stage for stage in response.json()["stages"]}
     assert stages["tts"]["progress"] == 42
     assert stages["tts"]["last_message"] == "Prepared 21/50 TTS clips"
+
+
+def test_task_detail_exposes_display_video_from_media_candidates(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=displayvid01", task_id="displayvid01")
+    session = tmp_path / "workfolder" / "Uploader" / "Title__displayvid01"
+    media = session / "media"
+    media.mkdir(parents=True)
+    source = media / "video_source.mp4"
+    source.write_bytes(b"source")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=None)
+    client = TestClient(main.app)
+
+    response = client.get(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200
+    assert response.json()["display_video_path"] == str(source)
+
+
+def test_final_video_artifact_uses_media_candidate_when_final_path_missing(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=artifactvid", task_id="artifactvid")
+    session = tmp_path / "workfolder" / "Uploader" / "Title__artifactvid"
+    media = session / "media"
+    media.mkdir(parents=True)
+    source = media / "video_source.mp4"
+    source.write_bytes(b"source-video")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=None)
+    client = TestClient(main.app)
+
+    response = client.get(f"/api/tasks/{task_id}/artifact/final-video")
+
+    assert response.status_code == 200
+    assert response.content == b"source-video"
 
 
 def test_delete_task_removes_session_log_and_record(monkeypatch, tmp_path):
@@ -695,6 +852,105 @@ def test_trim_video_accepts_minute_second_ranges_as_seconds(monkeypatch, tmp_pat
     assert response.json()["status"] == "queued"
 
 
+def test_trim_video_without_ranges_rejects_missing_cut_intervals(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "trim-default-session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final = media / "video_final.mp4"
+    final.write_bytes(b"video")
+    task_id = database.create_task("https://www.youtube.com/watch?v=cutranges005", task_id="cutranges005")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(final))
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+    client = TestClient(main.app)
+
+    response = client.post(f"/api/tasks/{task_id}/trim")
+
+    assert response.status_code == 400
+    assert enqueued == []
+    intervals_file = session / "metadata" / "cut_intervals.json"
+    assert not intervals_file.exists()
+    assert database.get_task(task_id)["cut_intervals_json"] is None
+    assert response.json()["detail"] == "No cut intervals provided and cut_intervals.json not found."
+
+
+def test_concat_video_endpoint_runs_concat_stage_directly(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "concat-session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    source = media / "video_source.mp4"
+    source.write_bytes(b"source")
+    final = media / "video_final.mp4"
+    final.write_bytes(b"final")
+    old_concat = media / "video_final_with_cta.mp4"
+    old_concat.write_bytes(b"old")
+    task_id = database.create_task("https://www.youtube.com/watch?v=concatapi01", task_id="concatapi01")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(old_concat))
+    database.update_stage(task_id, "concat_video", status="succeeded", completed_at=database.now_iso())
+    database.update_stage(task_id, "trim_video", status="succeeded", completed_at=database.now_iso())
+    captured: dict[str, Path] = {}
+
+    def fake_prepend_cta_clip(input_video, concat_session):
+        captured["input_video"] = input_video
+        captured["session"] = concat_session
+        old_concat.write_bytes(b"new")
+        return old_concat
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.prepend_cta_clip", fake_prepend_cta_clip)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+    client = TestClient(main.app)
+
+    response = client.post(f"/api/tasks/{task_id}/concat")
+
+    assert response.status_code == 200
+    assert enqueued == []
+    assert captured == {"input_video": final, "session": session}
+    assert old_concat.read_bytes() == b"new"
+    body = response.json()
+    stages = {stage["name"]: stage for stage in body["stages"]}
+    assert body["status"] == "paused"
+    assert body["current_stage"] == "concat_video"
+    assert body["final_video_path"] == str(old_concat)
+    assert stages["concat_video"]["status"] == "succeeded"
+    assert stages["trim_video"]["status"] == "pending"
+
+
+def test_concat_video_endpoint_skips_cta_for_zh_to_en(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "concat-zh-en-session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final = media / "video_final.mp4"
+    final.write_bytes(b"final")
+    old_concat = media / "video_final_with_cta.mp4"
+    old_concat.write_bytes(b"old")
+    task_id = database.create_task("https://www.bilibili.com/video/BV1xx411c7mD", task_id="BV1xx411c7mD")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(old_concat))
+    database.update_stage(task_id, "concat_video", status="succeeded", completed_at=database.now_iso())
+    database.update_stage(task_id, "trim_video", status="succeeded", completed_at=database.now_iso())
+
+    def fail_prepend_cta_clip(input_video, concat_session):
+        raise AssertionError("prepend_cta_clip should not run for zh->en")
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.prepend_cta_clip", fail_prepend_cta_clip)
+    client = TestClient(main.app)
+
+    response = client.post(f"/api/tasks/{task_id}/concat")
+
+    assert response.status_code == 200
+    assert not old_concat.exists()
+    body = response.json()
+    stages = {stage["name"]: stage for stage in body["stages"]}
+    assert body["status"] == "paused"
+    assert body["current_stage"] == "concat_video"
+    assert body["final_video_path"] == str(final)
+    assert stages["concat_video"]["status"] == "succeeded"
+    assert stages["trim_video"]["status"] == "pending"
+
+
 def test_cut_intervals_reject_invalid_ranges(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     task_id = database.create_task("https://www.youtube.com/watch?v=cutranges004", task_id="cutranges004")
@@ -842,14 +1098,45 @@ def test_bilibili_settings_save_author_tags_json(monkeypatch, tmp_path):
 
     saved = client.post(
         "/api/settings/bilibili",
-        json={"author_tags_json": '{"WolfeyVGC":"狼叔,宝可梦,VGC"}'},
+        json={
+            "author_tags_json": '{"WolfeyVGC":"狼叔,宝可梦,VGC"}',
+            "author_tids_json": '{"WolfeyVGC":201}',
+        },
     )
     loaded = client.get("/api/settings/bilibili")
 
     assert saved.status_code == 200
     assert saved.json()["author_tags_json"] == '{"WolfeyVGC": "狼叔,宝可梦,VGC"}'
+    assert saved.json()["author_tids_json"] == '{"WolfeyVGC": 201}'
     assert loaded.status_code == 200
     assert loaded.json() == saved.json()
+
+
+def test_bilibili_settings_save_author_config_json(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    saved = client.post(
+        "/api/settings/bilibili",
+        json={"author_config_json": '{"WolfeyVGC":{"tags":"狼叔,宝可梦,VGC","tid":17}}'},
+    )
+    loaded = client.get("/api/settings/bilibili")
+
+    assert saved.status_code == 200
+    assert saved.json()["author_config_json"] == '{"WolfeyVGC": {"tags": "狼叔,宝可梦,VGC", "tid": 17}}'
+    assert loaded.status_code == 200
+    assert loaded.json() == saved.json()
+
+
+def test_bilibili_settings_merges_legacy_author_config(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    database.save_bilibili_settings('{"WolfeyVGC":"狼叔,宝可梦,VGC"}', '{"WolfeyVGC":17}')
+    client = TestClient(main.app)
+
+    loaded = client.get("/api/settings/bilibili")
+
+    assert loaded.status_code == 200
+    assert loaded.json()["author_config_json"] == '{"WolfeyVGC": {"tags": "狼叔,宝可梦,VGC", "tid": 17}}'
 
 
 def test_bilibili_settings_rejects_invalid_author_tags_json(monkeypatch, tmp_path):
@@ -859,6 +1146,30 @@ def test_bilibili_settings_rejects_invalid_author_tags_json(monkeypatch, tmp_pat
     response = client.post(
         "/api/settings/bilibili",
         json={"author_tags_json": '["not", "an", "object"]'},
+    )
+
+    assert response.status_code == 422
+
+
+def test_bilibili_settings_rejects_invalid_author_tids_json(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/settings/bilibili",
+        json={"author_tids_json": '{"WolfeyVGC":"17"}'},
+    )
+
+    assert response.status_code == 422
+
+
+def test_bilibili_settings_rejects_invalid_author_config_json(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/settings/bilibili",
+        json={"author_config_json": '{"WolfeyVGC":{"tags":["bad"],"tid":17}}'},
     )
 
     assert response.status_code == 422

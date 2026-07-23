@@ -11,7 +11,7 @@ from . import database
 from .config import WORKFOLDER
 from .devices import device_plan_summary
 from .runtime_checks import validate_runtime_device
-from .sources import detect_source
+from .sources import detect_source, should_skip_cta_concat
 from .stages import STAGES
 from .youtube import is_local_upload_url
 
@@ -30,6 +30,7 @@ class PipelineArtifacts:
     dubbing_file: Path | None = None
     timings_file: Path | None = None
     final_video: Path | None = None
+    concatenated_video: Path | None = None
     trimmed_video: Path | None = None
 
 
@@ -69,6 +70,7 @@ class PipelineRunner:
             "tts": self._tts,
             "merge_audio": self._merge_audio,
             "merge_video": self._merge_video,
+            "concat_video": self._concat_video,
             "trim_video": self._trim_video,
         }
 
@@ -111,7 +113,14 @@ class PipelineRunner:
                 self.task_id,
                 status="succeeded",
                 current_stage="done",
-                final_video_path=str(_require(self.artifacts.trimmed_video or self.artifacts.final_video, "final_video")),
+                final_video_path=str(
+                    _require(
+                        self.artifacts.trimmed_video
+                        or self.artifacts.concatenated_video
+                        or self.artifacts.final_video,
+                        "final_video",
+                    )
+                ),
                 completed_at=database.now_iso(),
             )
             self.log("Task succeeded")
@@ -293,10 +302,38 @@ class PipelineRunner:
             self.artifacts.timings_file = _require_existing(session / "metadata" / "timings.json", "timings_file")
             return
         if stage == "merge_video":
-            self.artifacts.final_video = _require_existing(session / "media" / "video_final.mp4", "final_video")
+            final_video = session / "media" / "video_final.mp4"
+            if final_video.exists():
+                self.artifacts.final_video = final_video
+            else:
+                self.artifacts.video_file = _require_existing(session / "media" / "video_source.mp4", "video_file")
+            return
+        if stage == "concat_video":
+            source = detect_source(task["url"])
+            final_video = session / "media" / "video_final.mp4"
+            if final_video.exists():
+                self.artifacts.final_video = final_video
+                input_video = final_video
+            else:
+                input_video = _require_existing(session / "media" / "video_source.mp4", "video_file")
+                self.artifacts.video_file = input_video
+            if should_skip_cta_concat(source):
+                self.artifacts.concatenated_video = input_video
+            else:
+                self.artifacts.concatenated_video = _require_existing(
+                    session / "media" / "video_final_with_cta.mp4",
+                    "concatenated_video",
+                )
             return
         if stage == "trim_video":
-            self.artifacts.final_video = _require_existing(session / "media" / "video_final.mp4", "final_video")
+            final_video = session / "media" / "video_final.mp4"
+            if final_video.exists():
+                self.artifacts.final_video = final_video
+            else:
+                self.artifacts.video_file = _require_existing(session / "media" / "video_source.mp4", "video_file")
+            concatenated = session / "media" / "video_final_with_cta.mp4"
+            if concatenated.exists():
+                self.artifacts.concatenated_video = concatenated
             trimmed = session / "media" / "video_final_trimmed.mp4"
             if trimmed.exists():
                 self.artifacts.trimmed_video = trimmed
@@ -501,13 +538,51 @@ class PipelineRunner:
         size_mb = self.artifacts.final_video.stat().st_size / (1024 * 1024)
         self.stage_message("merge_video", f"Final video: {self.artifacts.final_video} ({size_mb:.1f} MB)")
 
+    def _concat_source_video(self, session: Path) -> Path:
+        final_video = self.artifacts.final_video
+        if final_video and final_video.exists():
+            return final_video
+        cached_final = session / "media" / "video_final.mp4"
+        if cached_final.exists():
+            self.artifacts.final_video = cached_final
+            return cached_final
+        video_file = self.artifacts.video_file
+        if video_file and video_file.exists():
+            return video_file
+        source_video = _require_existing(session / "media" / "video_source.mp4", "video_file")
+        self.artifacts.video_file = source_video
+        return source_video
+
+    def _concat_video(self, task: dict) -> None:
+        session = _require(self.artifacts.session, "session")
+        input_video = self._concat_source_video(session)
+        source = detect_source(task["url"])
+        if should_skip_cta_concat(source):
+            self.artifacts.concatenated_video = input_video
+            self.stage_message(
+                "concat_video",
+                f"Skipped CTA prepend for {source.asr_language}->{source.target_language}: {input_video}",
+            )
+            return
+        from .adapters.ffmpeg import prepend_cta_clip
+
+        self.artifacts.concatenated_video = prepend_cta_clip(input_video, session)
+        size_mb = self.artifacts.concatenated_video.stat().st_size / (1024 * 1024)
+        self.stage_message(
+            "concat_video",
+            f"Prepended CTA clip to {input_video.name}: {self.artifacts.concatenated_video} ({size_mb:.1f} MB)",
+        )
+
     def _trim_video(self, _: dict) -> None:
         import json as _json
 
         from .adapters.ffmpeg import trim_video
 
         session = _require(self.artifacts.session, "session")
-        final_video = _require(self.artifacts.final_video, "final_video")
+        final_video = _require(
+            self.artifacts.concatenated_video or self._concat_source_video(session),
+            "final_video",
+        )
 
         intervals_file = session / "metadata" / "cut_intervals.json"
         if not intervals_file.exists():
