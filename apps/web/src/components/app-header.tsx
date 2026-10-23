@@ -1,14 +1,16 @@
 "use client"
 
 import Link from "next/link"
-import { ArrowLeft } from "lucide-react"
+import { usePathname } from "next/navigation"
+import { ArrowLeft, ListTree, Settings } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import { SettingsDialog } from "@/components/settings-dialog"
 import { useI18n } from "@/lib/i18n"
 
 export function AppHeader({ backHref }: { backHref?: string }) {
   const { t } = useI18n()
+  const pathname = usePathname()
+  const showCategoriesLink = pathname !== "/bilibili-categories"
 
   return (
     <header className="flex flex-col gap-4 border-b border-[#00aeec]/25 pb-5 sm:flex-row sm:items-center sm:justify-between">
@@ -32,7 +34,26 @@ export function AppHeader({ backHref }: { backHref?: string }) {
           />
         </Link>
       </div>
-      <SettingsDialog />
+      <div className="flex flex-wrap items-center gap-2">
+        {showCategoriesLink ? (
+          <Button
+            variant="outline"
+            nativeButton={false}
+            render={<Link href="/bilibili-categories" />}
+          >
+            <ListTree className="size-4" />
+            {t.common.bilibiliCategories}
+          </Button>
+        ) : null}
+        <Button
+          variant="outline"
+          nativeButton={false}
+          render={<Link href="/settings" />}
+        >
+          <Settings className="size-4" />
+          {t.settings.button}
+        </Button>
+      </div>
     </header>
   )
 }
