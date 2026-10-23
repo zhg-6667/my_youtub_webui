@@ -3,7 +3,7 @@
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { ChangeEvent, FormEvent, Suspense, useCallback, useEffect, useRef, useState } from "react"
-import { ChevronRight, ExternalLink, Link2, Play, Plus, Trash2, Upload } from "lucide-react"
+import { ChevronRight, ExternalLink, Link2, Loader2, Play, Plus, Trash2, Upload } from "lucide-react"
 
 import {
   ExecutionMode,
@@ -12,6 +12,7 @@ import {
   VideoLinkRecord,
   createTask,
   createVideoLink,
+  continueTask,
   deleteTask,
   deleteVideoLink,
   listVideoLinks,
@@ -19,6 +20,7 @@ import {
   uploadLocalTask,
 } from "@/lib/api"
 import { useI18n } from "@/lib/i18n"
+import { BilibiliBatchSchedule, beijingTime } from "@/components/bilibili-batch-schedule"
 import { statusBadgeClass } from "@/lib/status"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -97,6 +99,7 @@ export function HomeContent() {
   const [executionMode, setExecutionMode] = useState<ExecutionMode>("auto")
   const [autoBilibiliUpload, setAutoBilibiliUpload] = useState(false)
   const [tasks, setTasks] = useState<TaskSummary[]>([])
+  const [historyLimit, setHistoryLimit] = useState(100)
   const [videoLinks, setVideoLinks] = useState<VideoLinkRecord[]>([])
   const [error, setError] = useState("")
   const [recordError, setRecordError] = useState("")
@@ -107,6 +110,8 @@ export function HomeContent() {
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([])
   const [deletingTasks, setDeletingTasks] = useState(false)
   const [taskDeleteError, setTaskDeleteError] = useState("")
+  const [continuingTaskId, setContinuingTaskId] = useState<string | null>(null)
+  const [taskContinueError, setTaskContinueError] = useState("")
 
   function applyTaskList(list: TaskSummary[]) {
     const selectable = new Set(list.filter((task) => task.status !== "running").map((task) => task.id))
@@ -118,7 +123,7 @@ export function HomeContent() {
   }
 
   async function refreshTasks() {
-    const { tasks: list } = await listTasks()
+    const { tasks: list } = await listTasks(historyLimit)
     applyTaskList(list)
   }
 
@@ -153,7 +158,7 @@ export function HomeContent() {
 
     const loadTasks = async () => {
       try {
-        const { tasks: list } = await listTasks()
+        const { tasks: list } = await listTasks(historyLimit)
         if (!cancelled) applyTaskList(list)
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : t.home.loadError)
@@ -166,7 +171,7 @@ export function HomeContent() {
       cancelled = true
       window.clearInterval(interval)
     }
-  }, [t.home.loadError])
+  }, [t.home.loadError, historyLimit])
 
   useEffect(() => {
     let cancelled = false
@@ -220,7 +225,6 @@ export function HomeContent() {
       if (subtitleInputRef.current) {
         subtitleInputRef.current.value = ""
       }
-      refreshTasks().catch(() => undefined)
       if (pendingVideoLinkRecordId) {
         try {
           await deleteVideoLink(pendingVideoLinkRecordId)
@@ -229,8 +233,10 @@ export function HomeContent() {
         } catch (deleteErr) {
           setRecordError(deleteErr instanceof Error ? deleteErr.message : t.home.videoLinkDeleteError)
         }
+      } else {
+        refreshTasks().catch(() => undefined)
+        router.push(`/tasks/${created.id}`)
       }
-      router.push(`/tasks/${created.id}`)
     } catch (err) {
       setError(err instanceof Error ? err.message : t.home.createError)
     } finally {
@@ -271,7 +277,6 @@ export function HomeContent() {
   function createFromVideoLink(record: VideoLinkRecord) {
     fillCreateUrl(record.url)
     setPendingVideoLinkRecordId(record.id)
-    router.push(`/?url=${encodeURIComponent(record.url)}`)
   }
 
   const queued = activeCount(tasks)
@@ -326,9 +331,22 @@ export function HomeContent() {
     }
   }
 
+  async function continueRemainingStages(taskId: string) {
+    setContinuingTaskId(taskId)
+    setTaskContinueError("")
+    try {
+      await continueTask(taskId, "auto")
+      await refreshTasks()
+    } catch (err) {
+      setTaskContinueError(err instanceof Error ? err.message : t.task.continueError)
+    } finally {
+      setContinuingTaskId(null)
+    }
+  }
+
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6">
-        <div className="grid gap-6 lg:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)] lg:items-start">
+    <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-6">
+        <div className="grid gap-6 xl:grid-cols-[minmax(280px,0.5fr)_minmax(360px,1fr)_minmax(360px,1fr)] xl:items-start">
           <Card>
             <CardHeader>
               <CardTitle>{t.home.createTitle}</CardTitle>
@@ -361,7 +379,7 @@ export function HomeContent() {
                     disabled={Boolean(youtubeUrl.trim()) || hasLocalFile}
                   />
                 </div>
-                <div className="grid gap-3 sm:grid-cols-[1fr_180px]">
+                <div className="grid gap-3 2xl:grid-cols-[1fr_180px]">
                   <div className="space-y-2">
                     <Label htmlFor="local-video">{t.home.localVideoLabel}</Label>
                     <Input
@@ -454,8 +472,8 @@ export function HomeContent() {
             </CardContent>
           </Card>
 
-          <div className="flex min-w-0 flex-col gap-6">
-            <Card>
+          <div className="contents">
+            <Card className="min-w-0 xl:order-3">
               <CardHeader>
                 <CardTitle>{t.home.videoLinkRecords} ({videoLinks.length})</CardTitle>
               </CardHeader>
@@ -542,11 +560,15 @@ export function HomeContent() {
               </CardContent>
             </Card>
 
-            <Card>
-              <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <Card className="min-w-0 xl:order-2">
+              <CardHeader className="flex flex-col gap-3">
                 <CardTitle>{t.home.taskHistory} ({tasks.length})</CardTitle>
-                {tasks.length > 0 ? (
-                  <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <BilibiliBatchSchedule
+                    selectedTasks={tasks.filter((task) => selectedTaskIds.includes(task.id))}
+                    onCreated={() => { setSelectedTaskIds([]); void refreshTasks() }}
+                  />
+                  {tasks.length > 0 ? <>
                     <label className="flex items-center gap-2 text-xs text-muted-foreground">
                       <Input
                         type="checkbox"
@@ -570,13 +592,18 @@ export function HomeContent() {
                       <Trash2 className="size-4" />
                       {deletingTasks ? t.home.taskDeletingSelected : t.home.taskDeleteSelected}
                     </Button>
-                  </div>
-                ) : null}
+                  </> : null}
+                </div>
               </CardHeader>
               <CardContent className="px-0">
                 {taskDeleteError ? (
                   <div className="mx-6 mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
                     {taskDeleteError}
+                  </div>
+                ) : null}
+                {taskContinueError ? (
+                  <div className="mx-6 mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                    {taskContinueError}
                   </div>
                 ) : null}
                 {tasks.length === 0 ? (
@@ -587,8 +614,8 @@ export function HomeContent() {
                   <ScrollArea className={tasks.length > 5 ? "h-[22.5rem]" : ""}>
                     <ul className="flex flex-col">
                       {tasks.map((item) => (
-                        <li key={item.id} className="flex h-[4.5rem] border-b border-border/60 last:border-b-0">
-                          <label className="flex h-full items-center px-6 pr-0">
+                        <li key={item.id} className="flex min-h-[4.5rem] border-b border-border/60 last:border-b-0">
+                          <label className="flex items-center px-6 pr-0">
                             <Input
                               type="checkbox"
                               aria-label={`${t.home.taskSelectOne} ${item.title || shortUrl(item.url)}`}
@@ -600,7 +627,7 @@ export function HomeContent() {
                           </label>
                           <Link
                             href={`/tasks/${item.id}`}
-                            className="flex h-full min-w-0 flex-1 items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-muted/60"
+                            className="flex min-w-0 flex-1 items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-muted/60"
                           >
                             <div className="min-w-0 flex-1">
                               <p className="truncate text-left font-medium text-zinc-900">
@@ -619,14 +646,40 @@ export function HomeContent() {
                                   <span className="shrink-0">· {t.home.taskRunningLocked}</span>
                                 ) : null}
                               </div>
+                              {item.bilibili_batch_id && item.bilibili_scheduled_publish_at ? (
+                                <p className="mt-1 truncate text-xs text-sky-700">
+                                  {t.home.batchPublication}: {beijingTime(item.bilibili_scheduled_publish_at)} · {t.home[`batchStatus_${item.bilibili_upload_status}`] || item.bilibili_upload_status}
+                                </p>
+                              ) : null}
                             </div>
                             <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
                           </Link>
+                          {isAwaitingAction(item.status) ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="my-auto mr-4 shrink-0"
+                              aria-label={t.task.continueAutoTask}
+                              title={t.task.continueAutoTask}
+                              disabled={continuingTaskId !== null || deletingTasks}
+                              onClick={() => continueRemainingStages(item.id)}
+                            >
+                              {continuingTaskId === item.id ? (
+                                <Loader2 className="size-4 animate-spin" />
+                              ) : (
+                                <Play className="size-4" />
+                              )}
+                            </Button>
+                          ) : null}
                         </li>
                       ))}
                     </ul>
                   </ScrollArea>
                 )}
+                {tasks.length >= historyLimit ? <div className="px-6 pt-3">
+                  <Button type="button" variant="outline" size="sm" onClick={() => setHistoryLimit((current) => current + 100)}>{t.home.loadMoreTasks}</Button>
+                </div> : null}
               </CardContent>
             </Card>
           </div>
