@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -162,6 +163,74 @@ def test_merge_video_uses_absolute_media_paths_when_cwd_is_session(monkeypatch, 
     assert cwd_values[-1] == session.resolve()
 
 
+def test_fast_trim_video_uses_stream_copy_segments(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    input_video = media / "video_final.mp4"
+    input_video.write_bytes(b"source")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(ffmpeg, "_probe_duration", lambda _: 100.0)
+
+    def fake_run(cmd, check=False, timeout=None, cwd=None, **kwargs):
+        commands.append(cmd)
+        output = Path(cmd[-1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"out")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+
+    output = ffmpeg.fast_trim_video(input_video, [{"start": 10, "end": 20}], session)
+
+    assert output == media / "video_final_trimmed.mp4"
+    assert output.read_bytes() == b"out"
+    segment_commands = [cmd for cmd in commands if "-ss" in cmd]
+    concat_commands = [cmd for cmd in commands if "-f" in cmd and "concat" in cmd]
+    assert len(segment_commands) == 2
+    assert len(concat_commands) == 1
+    assert all(cmd[cmd.index("-c") + 1] == "copy" for cmd in segment_commands)
+    assert concat_commands[0][concat_commands[0].index("-c") + 1] == "copy"
+
+
+def test_trim_video_reencodes_keep_segments_before_concat(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    input_video = media / "video_final_with_cta.mp4"
+    input_video.write_bytes(b"source")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(ffmpeg, "_probe_duration", lambda _: 100.0)
+    monkeypatch.setattr(ffmpeg, "_video_encoders", lambda: [["-c:v", "libx264", "-preset", "fast", "-crf", "23"]])
+
+    def fake_run(cmd, check=False, timeout=None, cwd=None, **kwargs):
+        commands.append(cmd)
+        output = Path(cmd[-1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"out")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+
+    output = ffmpeg.trim_video(
+        input_video,
+        [{"start": 1.0, "end": 10.0}, {"start": 20.0, "end": 99.7}],
+        session,
+    )
+
+    assert output == media / "video_final_trimmed.mp4"
+    assert output.read_bytes() == b"out"
+    segment_commands = [cmd for cmd in commands if "-f" not in cmd]
+    concat_commands = [cmd for cmd in commands if "-f" in cmd and "concat" in cmd]
+    assert len(segment_commands) == 3
+    assert len(concat_commands) == 1
+    assert all("-filter_complex" not in cmd for cmd in commands)
+    assert all(cmd[cmd.index("-c:v") + 1] == "libx264" for cmd in segment_commands)
+    assert concat_commands[0][concat_commands[0].index("-c") + 1] == "copy"
+
+
 def test_split_subtitle_text_breaks_on_punctuation_and_keeps_protected():
     out = ffmpeg.split_subtitle_text("我们今天讨论一下宇宙的边界，那是一个神秘话题；不过别担心，我会详细解释。")
     assert len(out) >= 3
@@ -244,10 +313,10 @@ def test_generate_cta_clip_matches_reference_stream(monkeypatch, tmp_path):
 
     output = ffmpeg.generate_cta_clip(final_video, session)
 
-    assert output == session / "media" / "cta_follow_2s.mp4"
+    assert output == session / "media" / "cta_follow_1s.mp4"
     ffmpeg_command = commands[-1]
-    assert "color=c=0x121418:s=1280x720:r=30000/1001:d=2" in ffmpeg_command
-    assert "anullsrc=channel_layout=stereo:sample_rate=44100:d=2" in ffmpeg_command
+    assert "color=c=0x121418:s=1280x720:r=30000/1001:d=1" in ffmpeg_command
+    assert "anullsrc=channel_layout=stereo:sample_rate=44100:d=1" in ffmpeg_command
     assert ffmpeg_command[ffmpeg_command.index("-c:v") + 1] == "libx264"
     assert ffmpeg_command[ffmpeg_command.index("-profile:v") + 1] == "high"
     assert ffmpeg_command[ffmpeg_command.index("-level:v") + 1] == "5.1"
@@ -301,13 +370,74 @@ def test_generate_cta_clip_matches_av1_opus_reference(monkeypatch, tmp_path):
 
     output = ffmpeg.generate_cta_clip(source_video, session)
 
-    assert output == media / "cta_follow_2s.mp4"
+    assert output == media / "cta_follow_1s.mp4"
     ffmpeg_command = commands[-1]
-    assert "color=c=0x121418:s=1920x1080:r=60/1:d=2" in ffmpeg_command
-    assert "anullsrc=channel_layout=stereo:sample_rate=48000:d=2" in ffmpeg_command
+    assert "color=c=0x121418:s=1920x1080:r=60/1:d=1" in ffmpeg_command
+    assert "anullsrc=channel_layout=stereo:sample_rate=48000:d=1" in ffmpeg_command
     assert ffmpeg_command[ffmpeg_command.index("-c:v") + 1] == "libsvtav1"
     assert ffmpeg_command[ffmpeg_command.index("-c:a") + 1] == "libopus"
     assert ffmpeg_command[ffmpeg_command.index("-video_track_timescale") + 1] == "15360"
+
+
+def test_generate_cta_clip_wraps_portrait_text(monkeypatch, tmp_path):
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    source_video = media / "video_source.mp4"
+    source_video.write_bytes(b"source")
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, check=False, capture_output=False, text=False, **kwargs):
+        commands.append(cmd)
+        if "-show_entries" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    {
+                        "streams": [
+                            {
+                                "codec_type": "video",
+                                "codec_name": "h264",
+                                "profile": "Main",
+                                "level": 42,
+                                "pix_fmt": "yuv420p",
+                                "width": 608,
+                                "height": 1080,
+                                "avg_frame_rate": "24/1",
+                            },
+                            {
+                                "codec_type": "audio",
+                                "codec_name": "aac",
+                                "sample_rate": "48000",
+                                "channels": 1,
+                                "channel_layout": "mono",
+                            },
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        Path(cmd[-1]).write_bytes(b"cta")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg.subprocess, "run", fake_run)
+
+    ffmpeg.generate_cta_clip(source_video, session)
+
+    line_files = sorted((session / "tmp").glob("cta_follow_line*.txt"))
+    assert [path.read_text(encoding="utf-8") for path in line_files] == [
+        "如果你喜欢这些视频",
+        "请多多关注、一键三连",
+        "感谢！！",
+    ]
+    ffmpeg_command = commands[-1]
+    filter_arg = ffmpeg_command[ffmpeg_command.index("-vf") + 1]
+    font_sizes = [int(size) for size in re.findall(r"fontsize=(\d+)", filter_arg)]
+    assert filter_arg.count("drawtext=") == 3
+    assert len(font_sizes) == 3
+    assert font_sizes[0] < max(36, round(1080 * 0.072))
+    assert font_sizes[1] < max(36, round(1080 * 0.063))
 
 
 def test_prepend_cta_clip_copy_concats_without_reencoding_input(monkeypatch, tmp_path):
@@ -317,7 +447,7 @@ def test_prepend_cta_clip_copy_concats_without_reencoding_input(monkeypatch, tmp
     media.mkdir(parents=True)
     tmp_dir.mkdir(parents=True)
     final_video = media / "video_final.mp4"
-    cta_clip = tmp_dir / "cta_follow_2s.mp4"
+    cta_clip = tmp_dir / "cta_follow_1s.mp4"
     final_video.write_bytes(b"final")
     cta_clip.write_bytes(b"cta")
     commands: list[list[str]] = []
@@ -367,7 +497,7 @@ def test_prepend_cta_clip_rejects_too_short_output(monkeypatch, tmp_path):
     media.mkdir(parents=True)
     tmp_dir.mkdir(parents=True)
     final_video = media / "video_final.mp4"
-    cta_clip = tmp_dir / "cta_follow_2s.mp4"
+    cta_clip = tmp_dir / "cta_follow_1s.mp4"
     final_video.write_bytes(b"final")
     cta_clip.write_bytes(b"cta")
 

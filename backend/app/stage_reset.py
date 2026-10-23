@@ -18,11 +18,13 @@ STAGE_OWN_ARTIFACTS: dict[str, tuple[str, ...]] = {
     "merge_audio": ("tmp/audio_dubbing.wav", "metadata/timings.json", "segments/stretched", "segments/trimmed"),
     "merge_video": ("tmp/audio_mixed.m4a", "media/video_final.mp4"),
     "concat_video": (
+        "tmp/cta_follow_1s.mp4",
         "tmp/cta_follow_2s.mp4",
         "tmp/cta_follow_line1.txt",
         "tmp/cta_follow_line2.txt",
         "tmp/concat_video.txt",
         "tmp/video_final_with_cta.tmp.mp4",
+        "media/cta_follow_1s.mp4",
         "media/cta_follow_2s.mp4",
         "media/video_final_with_cta.mp4",
     ),

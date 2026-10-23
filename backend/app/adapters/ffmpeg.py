@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -301,7 +302,8 @@ CTA_CLIP_LINES = (
     "如果你喜欢这些视频",
     "请多多关注、一键三连，感谢！！",
 )
-CTA_CLIP_SECONDS = 2
+CTA_CLIP_SECONDS = 1
+CTA_TEXT_MAX_WIDTH_RATIO = 0.88
 
 
 def _probe_concat_reference(video_file: Path) -> dict[str, str | int]:
@@ -474,12 +476,62 @@ def _video_track_timescale(time_base: str | int) -> str | None:
     return str(value)
 
 
+def _text_width_units(text: str) -> float:
+    total = 0.0
+    for char in text:
+        if char.isspace():
+            total += 0.4
+        elif char.isascii():
+            total += 0.55
+        elif char in SUBTITLE_PUNCTUATION:
+            total += 0.5
+        else:
+            total += 1.0
+    return max(1.0, total)
+
+
+def _cta_lines_for_canvas(width: int, height: int) -> tuple[str, ...]:
+    if height <= width:
+        return CTA_CLIP_LINES
+    return (
+        CTA_CLIP_LINES[0],
+        "请多多关注、一键三连",
+        "感谢！！",
+    )
+
+
+def _cta_font_size(text: str, width: int, preferred_size: int, minimum_size: int) -> int:
+    max_by_width = round(width * CTA_TEXT_MAX_WIDTH_RATIO / _text_width_units(text))
+    return max(minimum_size, min(preferred_size, max_by_width))
+
+
+def _cta_text_filter(font: str, text_files: list[Path], width: int, height: int) -> str:
+    preferred_sizes = [round(height * 0.072), round(height * 0.063), round(height * 0.057)]
+    minimum_size = 22 if height > width else 32
+    sizes = [
+        _cta_font_size(path.read_text(encoding="utf-8"), width, max(36, preferred), minimum_size)
+        for path, preferred in zip(text_files, preferred_sizes, strict=False)
+    ]
+    line_gap = max(12, round(height * 0.028))
+    block_height = sum(sizes) + line_gap * (len(sizes) - 1)
+    y = round((height - block_height) / 2)
+    filters: list[str] = []
+    for path, size in zip(text_files, sizes, strict=True):
+        filters.append(
+            f"drawtext={font}:textfile='{_filter_path(path)}':fontsize={size}:"
+            f"fontcolor=white:x=(w-text_w)/2:y={y}"
+        )
+        y += size + line_gap
+    filters.append("format=yuv420p")
+    return ",".join(filters)
+
+
 def generate_cta_clip(reference_video: Path, session: Path) -> Path:
     media_dir = session / "media"
     tmp_dir = session / "tmp"
     media_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    clip = media_dir / "cta_follow_2s.mp4"
+    clip = media_dir / "cta_follow_1s.mp4"
     if clip.exists():
         clip.unlink()
 
@@ -490,23 +542,14 @@ def generate_cta_clip(reference_video: Path, session: Path) -> Path:
     sample_rate = int(settings["sample_rate"])
     channels = int(settings["channels"])
     channel_layout = str(settings.get("channel_layout") or _channel_layout(channels))
-    line1 = tmp_dir / "cta_follow_line1.txt"
-    line2 = tmp_dir / "cta_follow_line2.txt"
-    line1.write_text(CTA_CLIP_LINES[0], encoding="utf-8")
-    line2.write_text(CTA_CLIP_LINES[1], encoding="utf-8")
+    text_files: list[Path] = []
+    for index, text in enumerate(_cta_lines_for_canvas(width, height), start=1):
+        path = tmp_dir / f"cta_follow_line{index}.txt"
+        path.write_text(text, encoding="utf-8")
+        text_files.append(path)
 
     font = _drawtext_font_option()
-    first_size = max(36, round(height * 0.072))
-    second_size = max(32, round(height * 0.063))
-    first_y = round(height * 0.394)
-    second_y = round(height * 0.509)
-    vf = (
-        f"drawtext={font}:textfile='{_filter_path(line1)}':fontsize={first_size}:"
-        f"fontcolor=white:x=(w-text_w)/2:y={first_y},"
-        f"drawtext={font}:textfile='{_filter_path(line2)}':fontsize={second_size}:"
-        f"fontcolor=white:x=(w-text_w)/2:y={second_y},"
-        "format=yuv420p"
-    )
+    vf = _cta_text_filter(font, text_files, width, height)
     subprocess.run(
         [
             ffmpeg_binary(),
@@ -625,7 +668,7 @@ def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_fi
             "-i",
             str(bgm_input),
             "-filter_complex",
-            "[0:a]volume=1.0[a0];[1:a]volume=0.30[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0[aout]",
+            "[0:a]volume=0.90[a0];[1:a]volume=0.75[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0[aout]",
             "-map",
             "[aout]",
             "-c:a",
@@ -743,48 +786,82 @@ def trim_video(input_video: Path, cut_intervals: list[dict], session: Path) -> P
     session_dir = session.resolve()
     input_resolved = input_video.resolve()
     output_resolved = output_video.resolve()
-
-    trim_filters: list[str] = []
-    concat_inputs: list[str] = []
-    for i, (start, end) in enumerate(keep):
-        trim_filters.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];")
-        trim_filters.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}];")
-        concat_inputs.append(f"[v{i}][a{i}]")
-
-    n = len(keep)
-    filter_graph = "".join(trim_filters) + f"{''.join(concat_inputs)}concat=n={n}:v=1:a=1[outv][outa]"
+    parts_dir = session / "tmp" / "trim_parts"
+    tmp_output = parts_dir / "video_final_trimmed.tmp.mp4"
 
     encoders = _video_encoders()
     timeout = max(600, int(duration * 3))
     last_error: subprocess.SubprocessError | None = None
     for index, video_codec in enumerate(encoders):
+        if parts_dir.exists():
+            shutil.rmtree(parts_dir)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        parts: list[Path] = []
         try:
+            for part_index, (start, end) in enumerate(keep):
+                part = parts_dir / f"part_{part_index:04d}.mp4"
+                parts.append(part)
+                seek_margin = min(2.0, start)
+                subprocess.run(
+                    [
+                        ffmpeg_binary(),
+                        "-y",
+                        "-ss",
+                        str(max(0.0, start - seek_margin)),
+                        "-i",
+                        str(input_resolved),
+                        "-ss",
+                        str(seek_margin),
+                        "-t",
+                        str(max(0.0, end - start)),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a?",
+                        *video_codec,
+                        "-c:a",
+                        "aac",
+                        "-avoid_negative_ts",
+                        "make_zero",
+                        "-movflags",
+                        "+faststart",
+                        str(part.resolve()),
+                    ],
+                    check=True,
+                    timeout=max(600, int((end - start + seek_margin) * 3)),
+                    cwd=session_dir,
+                )
+
+            concat_file = parts_dir / "trim_concat.txt"
+            concat_file.write_text(
+                "".join(f"file '{_concat_file_path(part)}'\n" for part in parts),
+                encoding="utf-8",
+            )
             subprocess.run(
                 [
                     ffmpeg_binary(),
                     "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
                     "-i",
-                    str(input_resolved),
-                    "-filter_complex",
-                    filter_graph,
-                    "-map",
-                    "[outv]",
-                    "-map",
-                    "[outa]",
-                    *video_codec,
-                    "-c:a",
-                    "aac",
+                    str(concat_file.resolve()),
+                    "-c",
+                    "copy",
                     "-movflags",
                     "+faststart",
-                    str(output_resolved),
+                    str(tmp_output.resolve()),
                 ],
                 check=True,
                 timeout=timeout,
                 cwd=session_dir,
             )
+            tmp_output.replace(output_resolved)
             return output_video
         except subprocess.SubprocessError as error:
             last_error = error
+            tmp_output.unlink(missing_ok=True)
             detail = (
                 f"timed out after {timeout}s"
                 if isinstance(error, subprocess.TimeoutExpired)
@@ -796,5 +873,97 @@ def trim_video(input_video: Path, cut_intervals: list[dict], session: Path) -> P
                     f"falling back to {encoders[index + 1][1]}",
                     file=sys.stderr,
                 )
+        finally:
+            shutil.rmtree(parts_dir, ignore_errors=True)
     assert last_error is not None
     raise last_error
+
+
+def fast_trim_video(input_video: Path, cut_intervals: list[dict], session: Path) -> Path:
+    """Cut intervals with stream copy. Fast and lossless, but cuts near keyframes."""
+    media_dir = session / "media"
+    output_video = media_dir / "video_final_trimmed.mp4"
+    if output_video.exists():
+        return output_video
+
+    if not cut_intervals:
+        return input_video
+
+    duration = _probe_duration(input_video)
+    if duration is None:
+        raise RuntimeError(f"Cannot probe duration of {input_video}")
+
+    keep = _keep_intervals(cut_intervals, duration)
+    if not keep:
+        return input_video
+    if len(keep) == 1 and keep[0] == (0, duration):
+        return input_video
+
+    session_dir = session.resolve()
+    input_resolved = input_video.resolve()
+    output_resolved = output_video.resolve()
+    parts_dir = session / "tmp" / "fast_trim_parts"
+    if parts_dir.exists():
+        shutil.rmtree(parts_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    parts: list[Path] = []
+    try:
+        for index, (start, end) in enumerate(keep):
+            part = parts_dir / f"part_{index:04d}.mp4"
+            parts.append(part)
+            subprocess.run(
+                [
+                    ffmpeg_binary(),
+                    "-y",
+                    "-ss",
+                    str(start),
+                    "-i",
+                    str(input_resolved),
+                    "-t",
+                    str(max(0.0, end - start)),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a?",
+                    "-c",
+                    "copy",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    str(part.resolve()),
+                ],
+                check=True,
+                timeout=max(600, int((end - start) * 2)),
+                cwd=session_dir,
+            )
+
+        concat_file = parts_dir / "fast_trim_concat.txt"
+        concat_file.write_text(
+            "".join(f"file '{_concat_file_path(part)}'\n" for part in parts),
+            encoding="utf-8",
+        )
+        tmp_output = parts_dir / "video_final_trimmed.tmp.mp4"
+        subprocess.run(
+            [
+                ffmpeg_binary(),
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file.resolve()),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(tmp_output.resolve()),
+            ],
+            check=True,
+            timeout=max(600, int(duration)),
+            cwd=session_dir,
+        )
+        tmp_output.replace(output_resolved)
+    finally:
+        shutil.rmtree(parts_dir, ignore_errors=True)
+    return output_video

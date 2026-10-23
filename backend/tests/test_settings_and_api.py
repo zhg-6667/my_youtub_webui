@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -332,6 +333,59 @@ def test_create_task_can_enable_auto_bilibili_upload(monkeypatch, tmp_path):
     assert enqueued == ["autobilipub"]
 
 
+def test_update_task_bilibili_upload_settings(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=biliopts001",
+        task_id="biliopts001",
+    )
+    client = TestClient(main.app)
+    upload_after = (datetime.now() + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M")
+
+    response = client.put(
+        f"/api/tasks/{task_id}/bilibili-upload-settings",
+        json={
+            "auto_bilibili_upload": True,
+            "title": "预设投稿标题",
+            "description": "预设投稿简介",
+            "tags": "标签一,标签二",
+            "tid": 171,
+            "topic_name": "宝可梦集结",
+            "topic_id": 1245603,
+            "season_id": 7320255,
+            "section_id": 8081933,
+            "publish_mode": "scheduled",
+            "dtime": "2999-07-01T18:00",
+            "upload_after": upload_after,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["auto_bilibili_upload"] is True
+    assert body["bilibili_upload_title"] == "预设投稿标题"
+    assert body["bilibili_upload_description"] == "预设投稿简介"
+    assert body["bilibili_upload_tags"] == "标签一,标签二"
+    assert body["bilibili_upload_tid"] == 171
+    assert body["bilibili_topic_name"] == "宝可梦集结"
+    assert body["bilibili_topic_id"] == 1245603
+    assert body["bilibili_season_id"] == 7320255
+    assert body["bilibili_section_id"] == 8081933
+    assert body["bilibili_publish_mode"] == "scheduled"
+    assert body["bilibili_dtime"] == "2999-07-01T18:00"
+    assert body["bilibili_upload_after"] is not None
+    task = database.get_task(task_id)
+    assert task["auto_bilibili_upload"] == 1
+    assert task["bilibili_upload_title"] == "预设投稿标题"
+    assert task["bilibili_upload_description"] == "预设投稿简介"
+    assert task["bilibili_upload_tags"] == "标签一,标签二"
+    assert task["bilibili_upload_tid"] == 171
+    assert task["bilibili_topic_name"] == "宝可梦集结"
+    assert task["bilibili_topic_id"] == 1245603
+    assert task["bilibili_season_id"] == 7320255
+    assert task["bilibili_section_id"] == 8081933
+
+
 def test_different_videos_create_separate_tasks(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     enqueued: list[str] = []
@@ -391,6 +445,82 @@ def test_task_detail_exposes_display_video_from_media_candidates(monkeypatch, tm
 
     assert response.status_code == 200
     assert response.json()["display_video_path"] == str(source)
+
+
+def test_task_detail_includes_bilibili_publish_info(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=publishinfo", task_id="publishinfo")
+    session = tmp_path / "workfolder" / "Uploader" / "Title__publishinfo"
+    metadata = session / "metadata"
+    metadata.mkdir(parents=True)
+    (metadata / "ytdlp_info.json").write_text(
+        json.dumps(
+            {
+                "id": "publishinfo",
+                "title": "Original title",
+                "description": "Original description",
+                "uploader": "Creator",
+                "uploader_id": "@creator",
+                "uploader_url": "https://www.youtube.com/@creator",
+                "upload_date": "20260728",
+                "webpage_url": "https://www.youtube.com/watch?v=publishinfo",
+                "duration": 125,
+                "view_count": 12345,
+                "like_count": 678,
+                "comment_count": 90,
+                "categories": ["Gaming"],
+                "tags": ["demo", "test"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (session / "cover.jpg").write_bytes(b"cover-image")
+    database.save_bilibili_settings(
+        author_config_json='{"Creator":{"tags":"游戏,测试","tid":171}}'
+    )
+    database.update_task(task_id, session_path=str(session), bilibili_upload_title="中文标题")
+    client = TestClient(main.app)
+
+    response = client.get(f"/api/tasks/{task_id}")
+
+    assert response.status_code == 200
+    info = response.json()["bilibili_publish_info"]
+    assert info["author"] == "Creator"
+    assert info["author_id"] == "@creator"
+    assert info["source_description"] == "Original description"
+    assert info["source_upload_date"] == "20260728"
+    assert info["duration_seconds"] == 125
+    assert info["view_count"] == 12345
+    assert info["publish_tags"] == ["游戏", "测试"]
+    assert info["publish_tid"] == 171
+    assert info["cover_available"] is True
+    assert info["publish_description"] == (
+        "请大家多多关注、点赞、投币、收藏，有什么想看的也可以评论区说\n"
+        "2026年7月28日\n"
+        "https://www.youtube.com/watch?v=publishinfo"
+    )
+
+    cover_response = client.get(f"/api/tasks/{task_id}/artifact/source-cover")
+    assert cover_response.status_code == 200
+    assert cover_response.content == b"cover-image"
+
+
+def test_open_task_folder_endpoint_opens_session_directory(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=openfolder1", task_id="openfolder1")
+    session = tmp_path / "workfolder" / "Uploader" / "Title__openfolder1"
+    session.mkdir(parents=True)
+    database.update_task(task_id, session_path=str(session))
+    opened: list[object] = []
+    monkeypatch.setattr(main, "_open_directory", lambda path: opened.append(path))
+    client = TestClient(main.app)
+
+    response = client.post(f"/api/tasks/{task_id}/open-folder")
+
+    assert response.status_code == 200
+    assert response.json() == {"path": str(session)}
+    assert opened == [session]
 
 
 def test_final_video_artifact_uses_media_candidate_when_final_path_missing(monkeypatch, tmp_path):
@@ -828,6 +958,17 @@ def test_trim_video_accepts_minute_second_ranges_as_seconds(monkeypatch, tmp_pat
     final.write_bytes(b"video")
     task_id = database.create_task("https://www.youtube.com/watch?v=cutranges003", task_id="cutranges003")
     database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(final))
+    trimmed = media / "video_final_trimmed.mp4"
+    captured = {}
+
+    def fake_trim_video(input_video, cut_intervals, trim_session):
+        captured["input_video"] = input_video
+        captured["cut_intervals"] = cut_intervals
+        captured["session"] = trim_session
+        trimmed.write_bytes(b"trimmed")
+        return trimmed
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.trim_video", fake_trim_video)
     enqueued: list[str] = []
     monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
     client = TestClient(main.app)
@@ -843,13 +984,218 @@ def test_trim_video_accepts_minute_second_ranges_as_seconds(monkeypatch, tmp_pat
     )
 
     assert response.status_code == 200
-    assert enqueued == [task_id]
+    assert enqueued == []
     intervals_file = session / "metadata" / "cut_intervals.json"
-    assert json.loads(intervals_file.read_text(encoding="utf-8")) == [
+    expected_intervals = [
         {"start": 370.0, "end": 380.0},
         {"start": 430.0, "end": 450.0},
     ]
-    assert response.json()["status"] == "queued"
+    assert json.loads(intervals_file.read_text(encoding="utf-8")) == expected_intervals
+    assert captured == {"input_video": final, "cut_intervals": expected_intervals, "session": session}
+    body = response.json()
+    stages = {stage["name"]: stage for stage in body["stages"]}
+    assert body["status"] == "paused"
+    assert body["current_stage"] == "trim_video"
+    assert body["final_video_path"] == str(trimmed)
+    assert stages["trim_video"]["status"] == "succeeded"
+
+
+def test_trim_video_endpoint_uses_requested_source_path(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "trim-source-session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final = media / "video_final.mp4"
+    final.write_bytes(b"final")
+    source = media / "video_source.mp4"
+    source.write_bytes(b"source")
+    custom = tmp_path / "custom-source.mp4"
+    custom.write_bytes(b"custom")
+    trimmed = media / "video_final_trimmed.mp4"
+    task_id = database.create_task("https://www.youtube.com/watch?v=cutranges006", task_id="cutranges006")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(final))
+    captured = {}
+
+    def fake_trim_video(input_video, cut_intervals, trim_session):
+        captured["input_video"] = input_video
+        captured["cut_intervals"] = cut_intervals
+        captured["session"] = trim_session
+        trimmed.write_bytes(b"trimmed")
+        return trimmed
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.trim_video", fake_trim_video)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/trim",
+        json={"source_video_path": str(custom), "cut_intervals": [{"start": 10, "end": 15}]},
+    )
+
+    assert response.status_code == 200
+    assert enqueued == []
+    assert captured == {
+        "input_video": custom,
+        "cut_intervals": [{"start": 10.0, "end": 15.0}],
+        "session": session,
+    }
+    assert response.json()["final_video_path"] == str(trimmed)
+
+
+def test_trim_video_endpoint_accepts_uploaded_source_file(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "trim-upload-session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final = media / "video_final.mp4"
+    final.write_bytes(b"final")
+    trimmed = media / "video_final_trimmed.mp4"
+    task_id = database.create_task("https://www.youtube.com/watch?v=cutranges007", task_id="cutranges007")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(final))
+    captured = {}
+
+    def fake_trim_video(input_video, cut_intervals, trim_session):
+        captured["input_video"] = input_video
+        captured["cut_intervals"] = cut_intervals
+        captured["session"] = trim_session
+        trimmed.write_bytes(b"trimmed")
+        return trimmed
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.trim_video", fake_trim_video)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/trim",
+        data={"cut_intervals": json.dumps([{"start": 12, "end": 18}])},
+        files={"source_video_file": ("picked.mp4", b"picked video", "video/mp4")},
+    )
+
+    assert response.status_code == 200
+    assert enqueued == []
+    assert captured["input_video"].name.endswith(".mp4")
+    assert captured["input_video"].parent == session / "tmp" / "trim_sources"
+    assert captured["input_video"].read_bytes() == b"picked video"
+    assert captured["cut_intervals"] == [{"start": 12.0, "end": 18.0}]
+    assert captured["session"] == session
+    assert response.json()["final_video_path"] == str(trimmed)
+
+
+def test_trim_input_video_path_uses_configured_priority(tmp_path):
+    media = tmp_path / "media"
+    media.mkdir()
+    cta = media / "video_final_with_cta.mp4"
+    trimmed = media / "video_final_trimmed.mp4"
+    final = media / "video_final.mp4"
+    source = media / "video_source.mp4"
+    for path in (trimmed, cta, final, source):
+        path.write_bytes(path.name.encode("utf-8"))
+
+    assert main.trim_input_video_path(str(tmp_path)) == cta
+    cta.unlink()
+    assert main.trim_input_video_path(str(tmp_path)) == final
+    final.unlink()
+    assert main.trim_input_video_path(str(tmp_path)) == source
+    source.unlink()
+    assert main.trim_input_video_path(str(tmp_path)) is None
+
+
+def test_fast_trim_video_endpoint_uses_default_video_priority(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "fast-trim-session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    cta = media / "video_final_with_cta.mp4"
+    cta.write_bytes(b"cta")
+    existing_trimmed = media / "video_final_trimmed.mp4"
+    existing_trimmed.write_bytes(b"existing trimmed")
+    final = media / "video_final.mp4"
+    final.write_bytes(b"final")
+    source = media / "video_source.mp4"
+    source.write_bytes(b"source")
+    trimmed = media / "video_final_trimmed.mp4"
+    task_id = database.create_task("https://www.youtube.com/watch?v=fasttrim01", task_id="fasttrim01")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(final))
+    captured = {}
+
+    def fake_fast_trim_video(input_video, cut_intervals, trim_session):
+        captured["input_video"] = input_video
+        captured["cut_intervals"] = cut_intervals
+        captured["session"] = trim_session
+        trimmed.write_bytes(b"trimmed")
+        return trimmed
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.fast_trim_video", fake_fast_trim_video)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/trim/fast",
+        json={"cut_intervals": [{"start": 10, "end": 15}]},
+    )
+
+    assert response.status_code == 200
+    assert enqueued == []
+    assert captured == {
+        "input_video": cta,
+        "cut_intervals": [{"start": 10.0, "end": 15.0}],
+        "session": session,
+    }
+    body = response.json()
+    stages = {stage["name"]: stage for stage in body["stages"]}
+    assert body["current_stage"] == "trim_video"
+    assert body["final_video_path"] == str(trimmed)
+    assert stages["trim_video"]["status"] == "succeeded"
+
+
+def test_fast_trim_replace_source_endpoint_renames_trimmed_video(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "fast-trim-replace-session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final = media / "video_final.mp4"
+    final.write_bytes(b"final")
+    source = media / "video_source.mp4"
+    source.write_bytes(b"source")
+    trimmed = media / "video_final_trimmed.mp4"
+    task_id = database.create_task("https://www.youtube.com/watch?v=fastreplace1", task_id="fastreplace1")
+    database.update_task(task_id, status="paused", session_path=str(session), final_video_path=str(final))
+    captured = {}
+
+    def fake_fast_trim_video(input_video, cut_intervals, trim_session):
+        captured["input_video"] = input_video
+        captured["cut_intervals"] = cut_intervals
+        captured["session"] = trim_session
+        trimmed.write_bytes(b"trimmed")
+        return trimmed
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.fast_trim_video", fake_fast_trim_video)
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+    client = TestClient(main.app)
+
+    response = client.post(
+        f"/api/tasks/{task_id}/trim/fast-replace-source",
+        json={"cut_intervals": [{"start": 10, "end": 15}]},
+    )
+
+    assert response.status_code == 200
+    assert enqueued == []
+    assert captured == {
+        "input_video": final,
+        "cut_intervals": [{"start": 10.0, "end": 15.0}],
+        "session": session,
+    }
+    assert source.read_bytes() == b"trimmed"
+    assert not trimmed.exists()
+    body = response.json()
+    stages = {stage["name"]: stage for stage in body["stages"]}
+    assert body["current_stage"] == "trim_video"
+    assert body["final_video_path"] == str(source)
+    assert stages["trim_video"]["status"] == "succeeded"
 
 
 def test_trim_video_without_ranges_rejects_missing_cut_intervals(monkeypatch, tmp_path):
@@ -1118,12 +1464,38 @@ def test_bilibili_settings_save_author_config_json(monkeypatch, tmp_path):
 
     saved = client.post(
         "/api/settings/bilibili",
-        json={"author_config_json": '{"WolfeyVGC":{"tags":"狼叔,宝可梦,VGC","tid":17}}'},
+        json={"author_config_json": '{"WolfeyVGC":{"tags":"狼叔,宝可梦,VGC","tid":17,"topic_name":"宝可梦集结","topic_id":1245603,"topic_mission_id":42,"season_id":123,"section_id":456}}'},
     )
     loaded = client.get("/api/settings/bilibili")
 
     assert saved.status_code == 200
-    assert saved.json()["author_config_json"] == '{"WolfeyVGC": {"tags": "狼叔,宝可梦,VGC", "tid": 17}}'
+    assert json.loads(saved.json()["author_config_json"]) == {
+        "WolfeyVGC": {
+            "tags": "狼叔,宝可梦,VGC",
+            "tid": 17,
+            "topic_name": "宝可梦集结",
+            "topic_id": 1245603,
+            "topic_mission_id": 42,
+            "season_id": 123,
+            "section_id": 456,
+        }
+    }
+    assert loaded.status_code == 200
+    assert loaded.json() == saved.json()
+
+
+def test_bilibili_settings_save_pokemon_topic_config_json(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    saved = client.post(
+        "/api/settings/bilibili",
+        json={"pokemon_topic_config_json": '{"宝可梦集结":1245603}'},
+    )
+    loaded = client.get("/api/settings/bilibili")
+
+    assert saved.status_code == 200
+    assert saved.json()["pokemon_topic_config_json"] == '{"宝可梦集结": 1245603}'
     assert loaded.status_code == 200
     assert loaded.json() == saved.json()
 
@@ -1170,6 +1542,30 @@ def test_bilibili_settings_rejects_invalid_author_config_json(monkeypatch, tmp_p
     response = client.post(
         "/api/settings/bilibili",
         json={"author_config_json": '{"WolfeyVGC":{"tags":["bad"],"tid":17}}'},
+    )
+
+    assert response.status_code == 422
+
+
+def test_bilibili_settings_rejects_incomplete_author_collection(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/settings/bilibili",
+        json={"author_config_json": '{"WolfeyVGC":{"season_id":123}}'},
+    )
+
+    assert response.status_code == 422
+
+
+def test_bilibili_settings_rejects_invalid_pokemon_topic_config_json(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/api/settings/bilibili",
+        json={"pokemon_topic_config_json": '{"宝可梦集结":"1245603"}'},
     )
 
     assert response.status_code == 422

@@ -92,6 +92,122 @@ def test_pipeline_auto_queues_bilibili_upload_on_success(monkeypatch, tmp_path):
     assert job["status"] == "queued"
 
 
+def test_pipeline_auto_uses_saved_bilibili_upload_settings(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=autobiliset",
+        task_id="autobiliset",
+        auto_bilibili_upload=True,
+        bilibili_upload_title="预设投稿标题",
+        bilibili_publish_mode="scheduled",
+        bilibili_dtime="2999-07-01T18:00",
+        bilibili_upload_after="2999-07-01T01:00:00+00:00",
+    )
+    database.update_task(
+        task_id,
+        bilibili_upload_description="自动投稿简介",
+        bilibili_upload_tags="自动,标签",
+        bilibili_upload_tid=171,
+        bilibili_topic_name="宝可梦集结",
+    )
+    final_path = tmp_path / "video_final.mp4"
+    final_path.write_bytes(b"mp4")
+    enqueued: list[str] = []
+    monkeypatch.setattr(bilibili_uploads, "enqueue", lambda job_id: enqueued.append(job_id))
+
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_concat_video", "_trim_video"):
+        monkeypatch.setattr(PipelineRunner, name, _noop_stage)
+
+    def merge_video(self, task):
+        self.artifacts.final_video = final_path
+
+    monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+
+    PipelineRunner(task_id).run()
+
+    assert enqueued == []
+    job = database.get_active_bilibili_upload_job(task_id)
+    assert job is not None
+    assert job["title"] == "预设投稿标题"
+    assert job["description"] == "自动投稿简介"
+    assert job["tags"] == "自动,标签"
+    assert job["tid"] == 171
+    assert job["topic_name"] == "宝可梦集结"
+    assert job["publish_mode"] == "scheduled"
+    assert job["dtime"] == "2999-07-01T18:00"
+    assert job["upload_after"] == "2999-07-01T01:00:00+00:00"
+    assert job["status"] == "scheduled"
+
+
+def test_download_applies_author_topic_and_collection_defaults_to_auto_upload(monkeypatch, tmp_path):
+    from backend.app.adapters import ytdlp
+
+    configure_db(monkeypatch, tmp_path)
+    database.save_bilibili_settings(
+        "",
+        "",
+        author_config_json=json.dumps({
+            "WolfeyVGC": {
+                "topic_name": "宝可梦集结",
+                "topic_id": 1245603,
+                "topic_mission_id": 42,
+                "season_id": 123,
+                "section_id": 456,
+            }
+        }),
+    )
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=authorcfg01",
+        task_id="authorcfg01",
+        auto_bilibili_upload=True,
+    )
+    session = tmp_path / "session"
+    (session / "media").mkdir(parents=True)
+    monkeypatch.setattr(
+        ytdlp,
+        "download_video",
+        lambda *args: (session, {"title": "测试视频", "uploader": "WolfeyVGC"}),
+    )
+    enqueued: list[str] = []
+    monkeypatch.setattr(bilibili_uploads, "enqueue", lambda job_id: enqueued.append(job_id))
+
+    runner = PipelineRunner(task_id)
+    runner._download(database.get_task(task_id))
+    task = database.get_task(task_id)
+    assert task["bilibili_topic_name"] == "宝可梦集结"
+    assert task["bilibili_topic_id"] == 1245603
+    assert task["bilibili_topic_mission_id"] == 42
+    assert task["bilibili_season_id"] == 123
+    assert task["bilibili_section_id"] == 456
+
+    runner._maybe_enqueue_auto_bilibili_upload()
+    assert len(enqueued) == 1
+    job = database.get_bilibili_upload_job(enqueued[0])
+    assert job["topic_name"] == "宝可梦集结"
+    assert job["topic_id"] == 1245603
+    assert job["topic_mission_id"] == 42
+    assert job["season_id"] == 123
+    assert job["section_id"] == 456
+
+    override_id = database.create_task(
+        "https://www.youtube.com/watch?v=authorcfg02",
+        task_id="authorcfg02",
+    )
+    database.update_task(
+        override_id,
+        bilibili_topic_name="手动话题",
+        bilibili_topic_id=99,
+        bilibili_season_id=7,
+        bilibili_section_id=8,
+    )
+    PipelineRunner(override_id)._download(database.get_task(override_id))
+    overridden = database.get_task(override_id)
+    assert overridden["bilibili_topic_name"] == "手动话题"
+    assert overridden["bilibili_topic_id"] == 99
+    assert overridden["bilibili_season_id"] == 7
+    assert overridden["bilibili_section_id"] == 8
+
+
 def test_pipeline_skips_already_succeeded_stages(monkeypatch, tmp_path):
     configure_db(monkeypatch, tmp_path)
     task_id = database.create_task("https://www.youtube.com/watch?v=resumevidxxx", task_id="resumevidxxx")

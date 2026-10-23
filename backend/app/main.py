@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
+import sys
 import uuid
 import json as _json
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from . import bilibili_uploads, database, watermark_masks, worker, youtube_channel_monitor
+from . import bilibili_cover, bilibili_schedule, bilibili_uploads, database, watermark_masks, worker, youtube_channel_monitor
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
 from .adapters.openai_translate import list_models as list_openai_models
@@ -69,10 +74,27 @@ def concat_input_video_path(session_path: str) -> Path | None:
     return None
 
 
+def trim_input_video_path(session_path: str) -> Path | None:
+    media_dir = Path(session_path) / "media"
+    for name in (
+        "video_final_with_cta.mp4",
+        "video_final.mp4",
+        "video_source.mp4",
+    ):
+        candidate = media_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 class TaskCreate(BaseModel):
     url: str
     execution_mode: str = "auto"
     auto_bilibili_upload: bool = False
+    bilibili_upload_title: str | None = None
+    bilibili_publish_mode: str = "now"
+    bilibili_dtime: str | None = None
+    bilibili_upload_after: str | None = None
 
 
 class VideoLinkRecordCreate(BaseModel):
@@ -98,12 +120,44 @@ class ContinueTaskRequest(BaseModel):
 
 class BilibiliUploadRequest(BaseModel):
     title: str
+    description: str | None = None
+    tags: str | None = None
+    tid: int | None = None
+    topic_name: str | None = None
+    topic_id: int | None = None
+    topic_mission_id: int | None = None
+    season_id: int | None = None
+    section_id: int | None = None
     publish_mode: str = "now"
     dtime: str | None = None
+    upload_after: str | None = None
+
+
+class BilibiliUploadSettingsRequest(BaseModel):
+    auto_bilibili_upload: bool = False
+    title: str | None = None
+    description: str | None = None
+    tags: str | None = None
+    tid: int | None = None
+    topic_name: str | None = None
+    topic_id: int | None = None
+    topic_mission_id: int | None = None
+    season_id: int | None = None
+    section_id: int | None = None
+    publish_mode: str = "now"
+    dtime: str | None = None
+    upload_after: str | None = None
 
 
 class BilibiliTitleTranslateRequest(BaseModel):
     title: str | None = None
+
+
+class BilibiliBatchPreviewRequest(BaseModel):
+    task_ids: list[str] = Field(min_length=1, max_length=500)
+    start_date: str
+    start_time: str = "00:00"
+    daily_times: list[str] = Field(min_length=1, max_length=24)
 
 
 class WatermarkMaskRequest(BaseModel):
@@ -117,6 +171,10 @@ class CutInterval(BaseModel):
 
 class CutIntervalsRequest(BaseModel):
     cut_intervals: list[CutInterval] = Field(default_factory=list)
+
+
+class TrimVideoRequest(CutIntervalsRequest):
+    source_video_path: str | None = None
 
 
 class YouTubeCookieUpdate(BaseModel):
@@ -144,6 +202,7 @@ class BilibiliSettingsUpdate(BaseModel):
     author_config_json: str = ""
     author_tags_json: str = ""
     author_tids_json: str = ""
+    pokemon_topic_config_json: str = ""
 
 
 class MailSettingsUpdate(BaseModel):
@@ -343,9 +402,47 @@ def normalize_bilibili_author_config_json(value: str) -> str:
             if tid <= 0:
                 raise HTTPException(status_code=422, detail="Bilibili author config tid values must be greater than 0.")
             item["tid"] = tid
+        if "topic_name" in profile:
+            topic_name = profile["topic_name"]
+            if not isinstance(topic_name, str):
+                raise HTTPException(status_code=422, detail="Bilibili author config topic_name values must be strings.")
+            item["topic_name"] = topic_name.strip()
+        for field in ("topic_id", "topic_mission_id", "season_id", "section_id"):
+            if field not in profile:
+                continue
+            number = profile[field]
+            if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                raise HTTPException(status_code=422, detail=f"Bilibili author config {field} must be a positive integer.")
+            item[field] = number
+        if ("season_id" in item) != ("section_id" in item):
+            raise HTTPException(status_code=422, detail="Bilibili author config season_id and section_id must be set together.")
         key = author.strip()
         if key:
             normalized[key] = item
+    return _json.dumps(normalized, ensure_ascii=False)
+
+
+def normalize_bilibili_pokemon_topic_config_json(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    try:
+        parsed = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"Bilibili Pokemon topic config must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=422, detail="Bilibili Pokemon topic config must be a JSON object.")
+    normalized: dict[str, int] = {}
+    for topic_name, topic_id in parsed.items():
+        if not isinstance(topic_name, str):
+            raise HTTPException(status_code=422, detail="Bilibili Pokemon topic config keys must be strings.")
+        if isinstance(topic_id, bool) or not isinstance(topic_id, int):
+            raise HTTPException(status_code=422, detail="Bilibili Pokemon topic config values must be integer topic IDs.")
+        if topic_id <= 0:
+            raise HTTPException(status_code=422, detail="Bilibili Pokemon topic IDs must be greater than 0.")
+        key = topic_name.strip()
+        if key:
+            normalized[key] = topic_id
     return _json.dumps(normalized, ensure_ascii=False)
 
 
@@ -403,17 +500,85 @@ app.add_middleware(
 )
 
 
-def _task_with_source(task: dict | None) -> dict | None:
+def _metadata_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _metadata_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _bilibili_publish_info(task: dict) -> dict | None:
+    session_path = task.get("session_path")
+    if not session_path:
+        return None
+    session = Path(session_path)
+    metadata_path = session / "metadata" / "ytdlp_info.json"
+    if not metadata_path.is_file():
+        return None
+    try:
+        info = _json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError):
+        return None
+    if not isinstance(info, dict):
+        return None
+
+    from scripts.upload_bilibili import (
+        DEFAULT_TID,
+        author_name,
+        author_upload_config,
+        build_desc,
+    )
+
+    author = author_name(info)
+    settings = database.get_bilibili_settings()
+    profiles = author_upload_config(
+        settings["author_config_json"],
+        legacy_tags_json=settings["author_tags_json"],
+        legacy_tids_json=settings["author_tids_json"],
+    )
+    profile = profiles.get(author, {})
+    tags = str(profile.get("tags") or "")
+    tid = int(profile.get("tid") or DEFAULT_TID)
+    return {
+        "source_title": str(info.get("title") or "").strip() or None,
+        "source_description": str(info.get("description") or "").strip() or None,
+        "source_url": str(info.get("webpage_url") or info.get("original_url") or "").strip() or None,
+        "source_upload_date": str(info.get("upload_date") or "").strip() or None,
+        "author": author or None,
+        "author_id": str(info.get("uploader_id") or info.get("channel_id") or "").strip() or None,
+        "author_url": str(info.get("uploader_url") or info.get("channel_url") or "").strip() or None,
+        "duration_seconds": _metadata_number(info.get("duration")),
+        "view_count": _metadata_number(info.get("view_count")),
+        "like_count": _metadata_number(info.get("like_count")),
+        "comment_count": _metadata_number(info.get("comment_count")),
+        "source_categories": _metadata_string_list(info.get("categories")),
+        "source_tags": _metadata_string_list(info.get("tags")),
+        "publish_description": build_desc(info),
+        "publish_tags": [item.strip() for item in tags.split(",") if item.strip()],
+        "publish_tid": tid,
+        "cover_available": (session / "cover.jpg").is_file(),
+    }
+
+
+def _task_with_source(task: dict | None, *, include_publish_info: bool = False) -> dict | None:
     if not task:
         return None
     result = dict(task)
     result["auto_bilibili_upload"] = bool(result.get("auto_bilibili_upload"))
+    result["bilibili_publish_mode"] = result.get("bilibili_publish_mode") or "now"
     display_video = bilibili_upload_video_path(result.get("session_path") or "")
     result["display_video_path"] = str(display_video) if display_video else None
     try:
         result["source_name"] = detect_source(result["url"]).name
     except ValueError:
         result["source_name"] = "unknown"
+    if include_publish_info:
+        result["bilibili_publish_info"] = _bilibili_publish_info(result)
     return result
 
 
@@ -579,11 +744,20 @@ def create_task(payload: TaskCreate) -> dict:
         return _task_with_source(database.get_task(existing_id))
 
     _ensure_runtime_ready()
+    publish_mode, dtime, upload_after = _normalize_bilibili_upload_settings(
+        payload.bilibili_publish_mode,
+        payload.bilibili_dtime,
+        payload.bilibili_upload_after,
+    )
     task_id = database.create_task(
         url,
         task_id=video_id,
         execution_mode=normalize_execution_mode(payload.execution_mode),
         auto_bilibili_upload=payload.auto_bilibili_upload,
+        bilibili_upload_title=(payload.bilibili_upload_title or "").strip() or None,
+        bilibili_publish_mode=publish_mode,
+        bilibili_dtime=dtime,
+        bilibili_upload_after=upload_after,
     )
     database.mark_video_link_record_task(video_id, task_id)
     worker.enqueue(task_id)
@@ -620,6 +794,28 @@ def _bilibili_cover_suffix(filename: str | None) -> str:
     if suffix not in ALLOWED_BILIBILI_COVER_SUFFIXES:
         raise HTTPException(status_code=422, detail="Only .jpg, .jpeg, .png, or .webp cover images are supported.")
     return suffix
+
+
+def _task_session_path(task_id: str) -> tuple[dict, Path]:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    session_path = task.get("session_path")
+    if not session_path:
+        raise HTTPException(status_code=400, detail="Task has no session path; run the download stage first.")
+    session = Path(session_path)
+    if not session.is_dir():
+        raise HTTPException(status_code=404, detail="Task session directory not found.")
+    return task, session
+
+
+def _image_media_type(path: Path) -> str:
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(path.suffix.lower(), "application/octet-stream")
 
 
 def _save_uploaded_file(file: UploadFile, destination: Path, *, max_bytes: int, too_large_detail: str) -> int:
@@ -713,7 +909,34 @@ def task_detail(task_id: str) -> dict:
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
-    return _task_with_source(task)
+    return _task_with_source(task, include_publish_info=True)
+
+
+def _open_directory(path: Path) -> None:
+    if sys.platform == "win32":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+@app.post("/api/tasks/{task_id}/open-folder")
+def open_task_folder(task_id: str) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    session_path = task.get("session_path")
+    if not session_path:
+        raise HTTPException(status_code=400, detail="Task has no session directory yet.")
+    session_dir = Path(session_path)
+    if not session_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Task session directory not found.")
+    try:
+        _open_directory(session_dir)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open task directory: {exc}") from exc
+    return {"path": str(session_dir)}
 
 
 def _is_inside_workfolder(path: Path) -> bool:
@@ -726,6 +949,8 @@ def _is_inside_workfolder(path: Path) -> bool:
 
 
 def _purge_task(task: dict) -> None:
+    if database.get_active_bilibili_upload_job(task["id"]):
+        raise HTTPException(status_code=409, detail="该任务已有待上传或上传中的投稿，请先取消排期或等待上传完成。")
     session_path = task.get("session_path")
     if session_path:
         session_dir = Path(session_path)
@@ -818,8 +1043,162 @@ def save_cut_intervals(task_id: str, payload: CutIntervalsRequest) -> dict:
     return {"cut_intervals": intervals}
 
 
+def _trim_source_video_from_request(session: Path, source_video_path: str | None) -> Path:
+    raw = (source_video_path or "").strip()
+    if not raw:
+        default_input = trim_input_video_path(str(session))
+        if not default_input:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Task has no video_final_with_cta.mp4, video_final.mp4, "
+                    "or video_source.mp4 to trim."
+                ),
+            )
+        return default_input
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        session_candidate = session / candidate
+        candidate = session_candidate if session_candidate.is_file() else candidate
+    if not candidate.is_file():
+        raise HTTPException(status_code=400, detail="Trim source video not found.")
+    if candidate.suffix.lower() not in ALLOWED_VIDEO_SUFFIXES:
+        raise HTTPException(status_code=422, detail="Trim source video must be a supported video file.")
+    return candidate
+
+
+def _save_trim_source_video(session: Path, file: UploadFile) -> Path:
+    stored_name = _clean_upload_filename(file.filename)
+    destination = session / "tmp" / "trim_sources" / f"{uuid.uuid4()}{Path(stored_name).suffix.lower()}"
+    _save_uploaded_file(
+        file,
+        destination,
+        max_bytes=MAX_LOCAL_UPLOAD_BYTES,
+        too_large_detail="Trim source video is too large.",
+    )
+    return destination
+
+
+def _prepare_trim_input_for_output(input_video: Path, output_video: Path, session: Path) -> Path:
+    if not output_video.exists() or input_video.resolve() != output_video.resolve():
+        return input_video
+    source_copy = session / "tmp" / "trim_sources" / f"{uuid.uuid4()}{input_video.suffix.lower()}"
+    source_copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(input_video, source_copy)
+    return source_copy
+
+
+def _save_fast_trim_intervals(task_id: str, task: dict, session: Path, payload: CutIntervalsRequest | None) -> list[dict[str, float]]:
+    metadata_dir = session / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    intervals_file = metadata_dir / "cut_intervals.json"
+
+    if payload is not None:
+        intervals = normalize_cut_intervals(payload.cut_intervals)
+        serialized = serialize_cut_intervals(intervals)
+        database.save_task_cut_intervals(task_id, serialized)
+        intervals_file.write_text(serialized, encoding="utf-8")
+    else:
+        intervals = task_cut_intervals(task)
+        if intervals:
+            serialized = serialize_cut_intervals(intervals)
+            database.save_task_cut_intervals(task_id, serialized)
+            intervals_file.write_text(serialized, encoding="utf-8")
+
+    if not intervals_file.exists():
+        raise HTTPException(status_code=400, detail="No cut intervals provided and cut_intervals.json not found.")
+    return intervals
+
+
+def _run_fast_trim(task_id: str, task: dict, session: Path, payload: CutIntervalsRequest | None) -> Path:
+    intervals = _save_fast_trim_intervals(task_id, task, session, payload)
+
+    input_video = trim_input_video_path(str(session))
+    if not input_video:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Task has no video_final_with_cta.mp4, video_final.mp4, "
+                "or video_source.mp4 to trim."
+            ),
+        )
+
+    trimmed = session / "media" / "video_final_trimmed.mp4"
+    input_video = _prepare_trim_input_for_output(input_video, trimmed, session)
+    if trimmed.exists():
+        trimmed.unlink()
+
+    _ensure_runtime_ready()
+    database.update_task(task_id, current_stage="trim_video")
+    database.update_stage(
+        task_id,
+        "trim_video",
+        status="running",
+        progress=None,
+        started_at=database.now_iso(),
+        completed_at=None,
+        error_message=None,
+        last_message="Fast trim started",
+    )
+    try:
+        from .adapters.ffmpeg import fast_trim_video
+
+        trimmed_video = fast_trim_video(input_video, intervals, session)
+        size_mb = trimmed_video.stat().st_size / (1024 * 1024)
+        database.update_stage(
+            task_id,
+            "trim_video",
+            status="succeeded",
+            progress=100,
+            completed_at=database.now_iso(),
+            error_message=None,
+            last_message=f"Fast trimmed video: {trimmed_video} ({size_mb:.1f} MB)",
+        )
+        return trimmed_video
+    except Exception as exc:
+        database.update_stage(
+            task_id,
+            "trim_video",
+            status="failed",
+            completed_at=database.now_iso(),
+            error_message=str(exc),
+            last_message="Fast trim failed",
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/api/tasks/{task_id}/trim")
-def trim_video_task(task_id: str, payload: CutIntervalsRequest | None = None) -> dict:
+async def trim_video_task(task_id: str, request: Request) -> dict:
+    payload: TrimVideoRequest | None
+    source_video_file: UploadFile | None = None
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
+        form = await request.form()
+        raw_intervals = str(form.get("cut_intervals") or "[]")
+        try:
+            intervals_payload = _json.loads(raw_intervals)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="cut_intervals must be valid JSON.") from exc
+        payload = TrimVideoRequest(
+            cut_intervals=intervals_payload,
+            source_video_path=str(form.get("source_video_path") or "") or None,
+        )
+        maybe_source = form.get("source_video_file")
+        if maybe_source is not None and getattr(maybe_source, "filename", ""):
+            source_video_file = maybe_source  # type: ignore[assignment]
+    else:
+        raw_body = await request.body()
+        if raw_body.strip():
+            try:
+                payload = TrimVideoRequest(**_json.loads(raw_body))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail="Request body must be valid JSON.") from exc
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        else:
+            payload = None
+
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
@@ -850,13 +1229,105 @@ def trim_video_task(task_id: str, payload: CutIntervalsRequest | None = None) ->
         raise HTTPException(status_code=400, detail="No cut intervals provided and cut_intervals.json not found.")
 
     trimmed = session / "media" / "video_final_trimmed.mp4"
-    if trimmed.exists():
-        trimmed.unlink()
 
     _ensure_runtime_ready()
-    database.reset_stages_from(task_id, "trim_video")
-    database.queue_task_for_continue(task_id)
-    worker.enqueue(task_id)
+    input_video = (
+        _save_trim_source_video(session, source_video_file)
+        if source_video_file
+        else _trim_source_video_from_request(session, payload.source_video_path if payload else None)
+    )
+    input_video = _prepare_trim_input_for_output(input_video, trimmed, session)
+    if trimmed.exists():
+        trimmed.unlink()
+    database.update_stage(
+        task_id,
+        "trim_video",
+        status="pending",
+        progress=None,
+        started_at=None,
+        completed_at=None,
+        error_message=None,
+        last_message=None,
+    )
+    try:
+        runner = PipelineRunner(task_id)
+        runner.artifacts.session = session
+        runner.artifacts.trim_source_video = input_video
+        runner._run_stage("trim_video")
+        trimmed_video = runner.artifacts.trimmed_video
+        if not trimmed_video:
+            raise RuntimeError("Trim stage did not produce a video.")
+        database.update_task(task_id, final_video_path=str(trimmed_video), error_message=None)
+    except Exception as exc:
+        database.update_stage(
+            task_id,
+            "trim_video",
+            status="failed",
+            completed_at=database.now_iso(),
+            error_message=str(exc),
+            last_message="Failed",
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return _task_with_source(database.get_task(task_id))
+
+
+@app.post("/api/tasks/{task_id}/trim/fast")
+def fast_trim_video_task(task_id: str, payload: CutIntervalsRequest | None = None) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task["status"] in {"running", "queued"}:
+        raise HTTPException(status_code=409, detail="Task is already running or queued.")
+    session_path = task.get("session_path")
+    if not session_path:
+        raise HTTPException(status_code=400, detail="Task has no session path; run the pipeline first.")
+
+    session = Path(session_path)
+    trimmed_video = _run_fast_trim(task_id, task, session, payload)
+    database.update_task(task_id, final_video_path=str(trimmed_video), error_message=None)
+    return _task_with_source(database.get_task(task_id))
+
+
+@app.post("/api/tasks/{task_id}/trim/fast-replace-source")
+def fast_trim_replace_source_task(task_id: str, payload: CutIntervalsRequest | None = None) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task["status"] in {"running", "queued"}:
+        raise HTTPException(status_code=409, detail="Task is already running or queued.")
+    session_path = task.get("session_path")
+    if not session_path:
+        raise HTTPException(status_code=400, detail="Task has no session path; run the pipeline first.")
+
+    session = Path(session_path)
+    source_video = session / "media" / "video_source.mp4"
+    trimmed_video = _run_fast_trim(task_id, task, session, payload)
+    try:
+        source_video.parent.mkdir(parents=True, exist_ok=True)
+        if source_video.exists():
+            source_video.unlink()
+        trimmed_video.replace(source_video)
+        size_mb = source_video.stat().st_size / (1024 * 1024)
+        database.update_stage(
+            task_id,
+            "trim_video",
+            status="succeeded",
+            progress=100,
+            completed_at=database.now_iso(),
+            error_message=None,
+            last_message=f"Fast trim replaced source video: {source_video} ({size_mb:.1f} MB)",
+        )
+        database.update_task(task_id, final_video_path=str(source_video), error_message=None)
+    except Exception as exc:
+        database.update_stage(
+            task_id,
+            "trim_video",
+            status="failed",
+            completed_at=database.now_iso(),
+            error_message=str(exc),
+            last_message="Fast trim source replacement failed",
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return _task_with_source(database.get_task(task_id))
 
 
@@ -917,6 +1388,128 @@ def _normalize_bilibili_publish_mode(value: str) -> str:
     return mode
 
 
+def _normalize_bilibili_upload_after(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        if len(raw) == 10 and raw.isdigit():
+            timestamp = int(raw)
+        else:
+            normalized = raw.replace("Z", "+00:00")
+            parsed: datetime | None = None
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                    try:
+                        parsed = datetime.strptime(raw, fmt)
+                        break
+                    except ValueError:
+                        continue
+            if parsed is None:
+                raise ValueError
+            if parsed.tzinfo is None:
+                timestamp = int(parsed.timestamp())
+            else:
+                timestamp = int(parsed.astimezone(timezone.utc).timestamp())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Scheduled upload time must be a datetime or 10-digit Unix timestamp.",
+        ) from exc
+    if timestamp <= int(time.time()):
+        raise HTTPException(status_code=422, detail="Scheduled upload time must be in the future.")
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_bilibili_upload_settings(
+    publish_mode_value: str,
+    dtime_value: str | None,
+    upload_after_value: str | None,
+) -> tuple[str, str | None, str | None]:
+    publish_mode = _normalize_bilibili_publish_mode(publish_mode_value)
+    dtime = dtime_value.strip() if dtime_value else None
+    upload_after = _normalize_bilibili_upload_after(upload_after_value)
+    if publish_mode == "scheduled":
+        if not dtime:
+            raise HTTPException(status_code=422, detail="Scheduled publish time is required.")
+        from scripts.upload_bilibili import UploadBilibiliError, parse_dtime
+
+        try:
+            parse_dtime(dtime)
+        except UploadBilibiliError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    else:
+        dtime = None
+    return publish_mode, dtime, upload_after
+
+
+def _normalize_bilibili_upload_content(
+    task: dict,
+    *,
+    description: str | None,
+    tags: str | None,
+    tid: int | None,
+) -> tuple[str, str, int]:
+    defaults = _bilibili_publish_info(task) or {}
+    if description is None:
+        saved_description = task.get("bilibili_upload_description")
+        description = (
+            saved_description
+            if saved_description is not None
+            else str(defaults.get("publish_description") or "")
+        )
+    if tags is None:
+        saved_tags = task.get("bilibili_upload_tags")
+        tags = (
+            saved_tags
+            if saved_tags is not None
+            else ",".join(defaults.get("publish_tags") or [])
+        )
+    if tid is None:
+        saved_tid = task.get("bilibili_upload_tid")
+        tid = int(saved_tid or defaults.get("publish_tid") or 17)
+    if tid <= 0:
+        raise HTTPException(status_code=422, detail="Bilibili category ID must be greater than 0.")
+    return description.strip(), tags.strip(), tid
+
+
+def _normalize_bilibili_topic_name(value: str | None) -> str | None:
+    topic_name = (value or "").strip()
+    return topic_name or None
+
+
+def _normalize_bilibili_topic(
+    *,
+    topic_name: str | None,
+    topic_id: int | None,
+    topic_mission_id: int | None,
+) -> tuple[str | None, int | None, int | None]:
+    normalized_name = _normalize_bilibili_topic_name(topic_name)
+    if normalized_name is None:
+        return None, None, None
+    if topic_id is not None and topic_id <= 0:
+        raise HTTPException(status_code=422, detail="Bilibili topic ID must be greater than 0.")
+    if topic_mission_id is not None and topic_mission_id <= 0:
+        raise HTTPException(status_code=422, detail="Bilibili topic mission ID must be greater than 0.")
+    return normalized_name, topic_id, topic_mission_id
+
+
+def _normalize_bilibili_season(
+    *,
+    season_id: int | None,
+    section_id: int | None,
+) -> tuple[int | None, int | None]:
+    if season_id is None and section_id is None:
+        return None, None
+    if season_id is None or section_id is None:
+        raise HTTPException(status_code=422, detail="Bilibili season and section must be selected together.")
+    if season_id <= 0 or section_id <= 0:
+        raise HTTPException(status_code=422, detail="Bilibili season and section IDs must be greater than 0.")
+    return season_id, section_id
+
+
 def _normalize_watermark_mask_mode(value: str) -> str:
     mode = value.strip().lower()
     if mode not in {"patch", "blur"}:
@@ -942,6 +1535,78 @@ def translate_bilibili_title(task_id: str, payload: BilibiliTitleTranslateReques
     return {"title": translated}
 
 
+@app.get("/api/bilibili/seasons")
+def get_bilibili_seasons() -> dict:
+    from scripts.upload_bilibili import UploadBilibiliError, list_bilibili_seasons
+
+    try:
+        return {"seasons": list_bilibili_seasons()}
+    except UploadBilibiliError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/bilibili/topics/resolve")
+def resolve_bilibili_topic(name: str) -> dict:
+    from scripts.upload_bilibili import UploadBilibiliError, resolve_bilibili_topic_by_name
+
+    topic_name = _normalize_bilibili_topic_name(name)
+    if topic_name is None:
+        raise HTTPException(status_code=422, detail="Bilibili topic name is required.")
+    try:
+        topic = resolve_bilibili_topic_by_name(topic_name)
+    except UploadBilibiliError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "topic_id": topic.id,
+        "topic_name": topic.name,
+        "mission_id": topic.mission_id,
+    }
+
+
+@app.put("/api/tasks/{task_id}/bilibili-upload-settings")
+def update_bilibili_upload_settings(task_id: str, payload: BilibiliUploadSettingsRequest) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    publish_mode, dtime, upload_after = _normalize_bilibili_upload_settings(
+        payload.publish_mode,
+        payload.dtime,
+        payload.upload_after,
+    )
+    description, tags, tid = _normalize_bilibili_upload_content(
+        task,
+        description=payload.description,
+        tags=payload.tags,
+        tid=payload.tid,
+    )
+    season_id, section_id = _normalize_bilibili_season(
+        season_id=payload.season_id,
+        section_id=payload.section_id,
+    )
+    topic_name, topic_id, topic_mission_id = _normalize_bilibili_topic(
+        topic_name=payload.topic_name,
+        topic_id=payload.topic_id,
+        topic_mission_id=payload.topic_mission_id,
+    )
+    database.update_task(
+        task_id,
+        auto_bilibili_upload=1 if payload.auto_bilibili_upload else 0,
+        bilibili_upload_title=(payload.title or "").strip() or None,
+        bilibili_upload_description=description,
+        bilibili_upload_tags=tags,
+        bilibili_upload_tid=tid,
+        bilibili_topic_name=topic_name,
+        bilibili_topic_id=topic_id,
+        bilibili_topic_mission_id=topic_mission_id,
+        bilibili_season_id=season_id,
+        bilibili_section_id=section_id,
+        bilibili_publish_mode=publish_mode,
+        bilibili_dtime=dtime,
+        bilibili_upload_after=upload_after,
+    )
+    return _task_with_source(database.get_task(task_id), include_publish_info=True)
+
+
 @app.post("/api/tasks/{task_id}/bilibili-upload", status_code=202)
 async def create_bilibili_upload(task_id: str, request: Request) -> dict:
     cover_file: UploadFile | None = None
@@ -950,8 +1615,17 @@ async def create_bilibili_upload(task_id: str, request: Request) -> dict:
         form = await request.form()
         payload = BilibiliUploadRequest(
             title=str(form.get("title") or ""),
+            description=str(form.get("description")) if "description" in form else None,
+            tags=str(form.get("tags")) if "tags" in form else None,
+            tid=form.get("tid"),
+            topic_name=str(form.get("topic_name")) if "topic_name" in form else None,
+            topic_id=form.get("topic_id") or None,
+            topic_mission_id=form.get("topic_mission_id") or None,
+            season_id=form.get("season_id") or None,
+            section_id=form.get("section_id") or None,
             publish_mode=str(form.get("publish_mode") or "now"),
             dtime=str(form.get("dtime") or "") or None,
+            upload_after=str(form.get("upload_after") or "") or None,
         )
         maybe_cover = form.get("cover_file")
         if maybe_cover is not None and getattr(maybe_cover, "filename", ""):
@@ -975,19 +1649,26 @@ async def create_bilibili_upload(task_id: str, request: Request) -> dict:
     title = payload.title.strip()
     if not title:
         raise HTTPException(status_code=422, detail="Bilibili title is required.")
-    publish_mode = _normalize_bilibili_publish_mode(payload.publish_mode)
-    dtime = payload.dtime.strip() if payload.dtime else None
-    if publish_mode == "scheduled":
-        if not dtime:
-            raise HTTPException(status_code=422, detail="Scheduled publish time is required.")
-        from scripts.upload_bilibili import UploadBilibiliError, parse_dtime
-
-        try:
-            parse_dtime(dtime)
-        except UploadBilibiliError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-    else:
-        dtime = None
+    publish_mode, dtime, upload_after = _normalize_bilibili_upload_settings(
+        payload.publish_mode,
+        payload.dtime,
+        payload.upload_after,
+    )
+    description, tags, tid = _normalize_bilibili_upload_content(
+        task,
+        description=payload.description,
+        tags=payload.tags,
+        tid=payload.tid,
+    )
+    season_id, section_id = _normalize_bilibili_season(
+        season_id=payload.season_id,
+        section_id=payload.section_id,
+    )
+    topic_name, topic_id, topic_mission_id = _normalize_bilibili_topic(
+        topic_name=payload.topic_name,
+        topic_id=payload.topic_id,
+        topic_mission_id=payload.topic_mission_id,
+    )
 
     active = database.get_active_bilibili_upload_job(task_id)
     if active:
@@ -997,7 +1678,7 @@ async def create_bilibili_upload(task_id: str, request: Request) -> dict:
     cover_path: str | None = None
     if cover_file is not None:
         suffix = _bilibili_cover_suffix(cover_file.filename)
-        cover_dest = Path(session_path) / "metadata" / "bilibili_upload_covers" / f"{job_id}{suffix}"
+        cover_dest = bilibili_cover.cover_dir(session_path) / "jobs" / f"{job_id}{suffix}"
         _save_uploaded_file(
             cover_file,
             cover_dest,
@@ -1005,16 +1686,28 @@ async def create_bilibili_upload(task_id: str, request: Request) -> dict:
             too_large_detail="Uploaded Bilibili cover image is too large.",
         )
         cover_path = str(cover_dest)
+    else:
+        cover_path = bilibili_cover.snapshot_cover_for_job(session_path, job_id)
 
     job_id = database.create_bilibili_upload_job(
         task_id,
         title=title,
+        description=description,
+        tags=tags,
+        tid=tid,
+        topic_name=topic_name,
+        topic_id=topic_id,
+        topic_mission_id=topic_mission_id,
         publish_mode=publish_mode,
         dtime=dtime,
+        upload_after=upload_after,
         cover_path=cover_path,
+        season_id=season_id,
+        section_id=section_id,
         job_id=job_id,
     )
-    bilibili_uploads.enqueue(job_id)
+    if upload_after is None:
+        bilibili_uploads.enqueue(job_id)
     return database.get_bilibili_upload_job(job_id)
 
 
@@ -1033,6 +1726,112 @@ def get_bilibili_upload_log(job_id: str) -> str:
         raise HTTPException(status_code=404, detail="Bilibili upload job not found.")
     path = Path(job["log_path"] or database.bilibili_upload_log_path(job_id))
     return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+@app.get("/api/bilibili-upload-jobs/{job_id}/cover")
+def get_bilibili_upload_cover(job_id: str):
+    job = database.get_bilibili_upload_job(job_id)
+    cover = Path(job["cover_path"]) if job and job.get("cover_path") else None
+    if not cover or not cover.is_file():
+        raise HTTPException(status_code=404, detail="投稿封面不存在。")
+    return FileResponse(cover)
+
+
+@app.exception_handler(database.BilibiliUploadConflict)
+async def bilibili_upload_conflict_handler(request: Request, exc: database.BilibiliUploadConflict):
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+def _batch_publish_content(task: dict) -> dict:
+    """Resolve exactly the same defaults as single-video publishing, with fixed media."""
+    video = bilibili_upload_video_path(task.get("session_path") or "")
+    if not video or video.name == "video_source.mp4":
+        raise ValueError(f"任务 {task.get('title') or task['id']} 的成品视频不存在。")
+    from scripts.upload_bilibili import UploadBilibiliError, author_name, load_metadata
+
+    try:
+        author = author_name(load_metadata(Path(task["session_path"])))
+    except (UploadBilibiliError, _json.JSONDecodeError) as exc:
+        raise ValueError(f"任务 {task.get('title') or task['id']} 的投稿元数据不可用。") from exc
+    title = (task.get("bilibili_upload_title") or task.get("title") or "").strip()
+    if not title:
+        info = _bilibili_publish_info(task) or {}
+        title = str(info.get("source_title") or "").strip()
+    if not title:
+        raise ValueError(f"任务 {task['id']} 缺少发布标题，请先在任务详情中填写。")
+    description, tags, tid = _normalize_bilibili_upload_content(task, description=None, tags=None, tid=None)
+    topic_name, topic_id, topic_mission_id = _normalize_bilibili_topic(
+        topic_name=task.get("bilibili_topic_name"), topic_id=task.get("bilibili_topic_id"),
+        topic_mission_id=task.get("bilibili_topic_mission_id"),
+    )
+    season_id, section_id = _normalize_bilibili_season(
+        season_id=task.get("bilibili_season_id"), section_id=task.get("bilibili_section_id"),
+    )
+    cover, _ = bilibili_cover.resolve_cover_path(task["session_path"])
+    return {"title": title, "publish_title": f"{title}-{author}" if author else title,
+            "description": description, "tags": tags, "tid": tid,
+            "topic_name": topic_name, "topic_id": topic_id, "topic_mission_id": topic_mission_id,
+            "season_id": season_id, "section_id": section_id, "task_created_at": task["created_at"],
+            "video_path": str(video), "video_fingerprint": bilibili_schedule.fingerprint(video),
+            "cover_path": str(cover) if cover else None, "cover_fingerprint": bilibili_schedule.fingerprint(cover)}
+
+
+@app.post("/api/bilibili-publish-batches/preview")
+def preview_bilibili_batch(payload: BilibiliBatchPreviewRequest) -> dict:
+    try:
+        return bilibili_schedule.create_preview(
+            payload.task_ids, payload.start_date, payload.daily_times, _batch_publish_content,
+            start_time=payload.start_time,
+        )
+    except (ValueError, OSError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/bilibili-publish-batches")
+def list_bilibili_batches() -> dict:
+    return {"batches": bilibili_schedule.list_batches()}
+
+
+@app.get("/api/bilibili-publish-batches/{batch_id}")
+def get_bilibili_batch(batch_id: str) -> dict:
+    batch = bilibili_schedule.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="发布批次不存在。")
+    return batch
+
+
+@app.post("/api/bilibili-publish-batches/{batch_id}/confirm", status_code=202)
+def confirm_bilibili_batch(batch_id: str) -> dict:
+    try:
+        batch = bilibili_schedule.confirm_batch(batch_id, _batch_publish_content)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not batch:
+        raise HTTPException(status_code=404, detail="发布批次不存在。")
+    for item in batch["items"]:
+        if item["status"] == "queued":
+            bilibili_uploads.enqueue(item["job_id"])
+    return batch
+
+
+@app.post("/api/bilibili-publish-batches/{batch_id}/cancel-pending")
+def cancel_bilibili_batch(batch_id: str) -> dict:
+    batch = bilibili_schedule.cancel_pending(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="发布批次不存在。")
+    return batch
+
+
+@app.post("/api/bilibili-publish-batches/{batch_id}/jobs/{job_id}/retry", status_code=202)
+def retry_bilibili_batch_job(batch_id: str, job_id: str) -> dict:
+    try:
+        batch = bilibili_schedule.retry_job(batch_id, job_id)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not batch:
+        raise HTTPException(status_code=404, detail="发布任务不存在。")
+    bilibili_uploads.enqueue(job_id)
+    return batch
 
 
 @app.post("/api/tasks/{task_id}/watermark-mask", status_code=202)
@@ -1120,13 +1919,30 @@ def resume_task(task_id: str) -> dict:
     return _task_with_source(database.get_task(task_id))
 
 
+_BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+_LOG_TIMESTAMP = re.compile(
+    r"(?m)^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\]"
+)
+
+
+def _log_in_beijing_time(content: str) -> str:
+    def convert(match: re.Match[str]) -> str:
+        try:
+            timestamp = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+        except ValueError:
+            return match.group(0)
+        return f"[{timestamp.astimezone(_BEIJING_TIMEZONE).isoformat()}]"
+
+    return _LOG_TIMESTAMP.sub(convert, content)
+
+
 @app.get("/api/tasks/{task_id}/log", response_class=PlainTextResponse)
 def task_log(task_id: str) -> str:
     task = database.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
     path = database.log_path(task_id)
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    return _log_in_beijing_time(path.read_text(encoding="utf-8")) if path.exists() else ""
 
 
 @app.get("/api/tasks/{task_id}/artifact/final-video")
@@ -1143,6 +1959,110 @@ def final_video(task_id: str, download: bool = False) -> FileResponse:
         return FileResponse(final_path, media_type="video/mp4", filename=name)
     headers = {"Content-Disposition": f'inline; filename="{name}"'}
     return FileResponse(final_path, media_type="video/mp4", headers=headers)
+
+
+@app.get("/api/tasks/{task_id}/artifact/source-cover")
+def source_cover(task_id: str) -> FileResponse:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    session_path = task.get("session_path")
+    cover_path = Path(session_path) / "cover.jpg" if session_path else None
+    if not cover_path or not cover_path.is_file():
+        raise HTTPException(status_code=404, detail="Source cover is not available.")
+    return FileResponse(cover_path, media_type="image/jpeg")
+
+
+@app.get("/api/tasks/{task_id}/artifact/bilibili-cover")
+def bilibili_cover_artifact(task_id: str, background: bool = False) -> FileResponse:
+    _, session = _task_session_path(task_id)
+    if background:
+        cover_path = bilibili_cover.manual_cover_path(session) or bilibili_cover.source_cover_path(session)
+    else:
+        cover_path, _ = bilibili_cover.resolve_cover_path(session)
+    if not cover_path:
+        raise HTTPException(status_code=404, detail="Bilibili cover is not available.")
+    return FileResponse(cover_path, media_type=_image_media_type(cover_path))
+
+
+@app.get("/api/tasks/{task_id}/bilibili-cover")
+def get_bilibili_cover(task_id: str) -> dict:
+    _, session = _task_session_path(task_id)
+    resolved, source = bilibili_cover.resolve_cover_path(session)
+    project_path = bilibili_cover.editor_project_path(session)
+    project: dict | None = None
+    if project_path.is_file():
+        try:
+            parsed = _json.loads(project_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                project = parsed
+        except (OSError, _json.JSONDecodeError):
+            pass
+    return {
+        "available": bool(resolved),
+        "source": source,
+        "manual_available": bilibili_cover.manual_cover_path(session) is not None,
+        "edited_available": bilibili_cover.edited_cover_path(session) is not None,
+        "project": project,
+    }
+
+
+@app.put("/api/tasks/{task_id}/bilibili-cover/manual")
+def save_bilibili_manual_cover(task_id: str, file: UploadFile = File(...)) -> dict:
+    _, session = _task_session_path(task_id)
+    suffix = _bilibili_cover_suffix(file.filename)
+    bilibili_cover.remove_manual_cover(session)
+    destination = bilibili_cover.cover_dir(session) / f"{bilibili_cover.MANUAL_COVER_STEM}{suffix}"
+    _save_uploaded_file(
+        file,
+        destination,
+        max_bytes=MAX_BILIBILI_COVER_BYTES,
+        too_large_detail="Uploaded Bilibili cover image is too large.",
+    )
+    return get_bilibili_cover(task_id)
+
+
+@app.delete("/api/tasks/{task_id}/bilibili-cover/manual")
+def delete_bilibili_manual_cover(task_id: str) -> dict:
+    _, session = _task_session_path(task_id)
+    bilibili_cover.remove_manual_cover(session)
+    return get_bilibili_cover(task_id)
+
+
+@app.put("/api/tasks/{task_id}/bilibili-cover/edited")
+def save_bilibili_edited_cover(
+    task_id: str,
+    file: UploadFile = File(...),
+    project_json: str = Form(...),
+) -> dict:
+    _, session = _task_session_path(task_id)
+    try:
+        project = _json.loads(project_json)
+    except _json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="Invalid Bilibili cover editor project.") from exc
+    if not isinstance(project, dict):
+        raise HTTPException(status_code=422, detail="Bilibili cover editor project must be an object.")
+    _bilibili_cover_suffix(file.filename)
+    directory = bilibili_cover.cover_dir(session)
+    destination = directory / bilibili_cover.EDITED_COVER_NAME
+    _save_uploaded_file(
+        file,
+        destination,
+        max_bytes=MAX_BILIBILI_COVER_BYTES,
+        too_large_detail="Edited Bilibili cover image is too large.",
+    )
+    bilibili_cover.editor_project_path(session).write_text(
+        _json.dumps(project, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return get_bilibili_cover(task_id)
+
+
+@app.delete("/api/tasks/{task_id}/bilibili-cover/edited")
+def delete_bilibili_edited_cover(task_id: str) -> dict:
+    _, session = _task_session_path(task_id)
+    bilibili_cover.remove_edited_cover(session)
+    return get_bilibili_cover(task_id)
 
 
 @app.get("/api/cookies/youtube")
@@ -1224,6 +2144,7 @@ def save_bilibili_settings(payload: BilibiliSettingsUpdate) -> dict:
         normalize_bilibili_author_tags_json(payload.author_tags_json),
         normalize_bilibili_author_tids_json(payload.author_tids_json),
         author_config_json=normalize_bilibili_author_config_json(payload.author_config_json),
+        pokemon_topic_config_json=normalize_bilibili_pokemon_topic_config_json(payload.pokemon_topic_config_json),
     )
     return get_bilibili_settings()
 

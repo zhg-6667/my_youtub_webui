@@ -54,6 +54,29 @@ def _task_body(task: dict, event: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def _bilibili_upload_result(job: dict) -> str:
+    status = (job.get("status") or "").strip()
+    if status == "succeeded":
+        return "投稿成功"
+    if status == "failed":
+        error_message = (job.get("error_message") or "").strip()
+        return f"投稿失败: {error_message}" if error_message else "投稿失败"
+    return status or "未知"
+
+
+def _bilibili_upload_subject(job: dict) -> str:
+    title = (job.get("title") or "Untitled upload").strip()
+    return f"YouDub 投稿结果: {title}"
+
+
+def _bilibili_upload_body(job: dict) -> str:
+    lines = [
+        f"标题: {job.get('title') or ''}",
+        f"投稿结果: {_bilibili_upload_result(job)}",
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
 def send_mail(settings: dict[str, str], subject: str, body: str) -> None:
     host = settings["smtp_host"].strip()
     if not host:
@@ -103,12 +126,41 @@ def send_task_notification(task: dict, event: str) -> str:
     return "sent"
 
 
+def send_bilibili_upload_notification(job: dict) -> str:
+    settings = database.get_mail_settings()
+    if not setting_is_enabled(settings["enabled"]):
+        return "skipped: disabled"
+
+    status = (job.get("status") or "").strip()
+    if status == "succeeded" and not setting_is_enabled(settings["notify_on_success"]):
+        return "skipped: success notification disabled"
+    if status == "failed" and not setting_is_enabled(settings["notify_on_failure"]):
+        return "skipped: failure notification disabled"
+
+    send_mail(settings, _bilibili_upload_subject(job), _bilibili_upload_body(job))
+    return "sent"
+
+
 def notify_task_completion(task_id: str, event: str, log) -> None:
     task = database.get_task(task_id)
     if not task:
         return
     try:
         result = send_task_notification(task, event)
+        if result == "sent":
+            log("Mail notification sent")
+        elif result.startswith("skipped"):
+            log(f"Mail notification {result}")
+    except Exception as exc:
+        log(f"Mail notification failed: {exc}")
+
+
+def notify_bilibili_upload_completion(job_id: str, log) -> None:
+    job = database.get_bilibili_upload_job(job_id)
+    if not job:
+        return
+    try:
+        result = send_bilibili_upload_notification(job)
         if result == "sent":
             log("Mail notification sent")
         elif result.startswith("skipped"):

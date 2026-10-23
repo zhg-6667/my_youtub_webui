@@ -112,3 +112,32 @@ def test_task_notification_sends_when_enabled(monkeypatch, tmp_path):
     assert sent
     assert "YouDub 任务完成: Demo" == sent[0][0]
     assert "任务 ID: mailsendxxx" in sent[0][1]
+
+
+def test_bilibili_upload_notification_sends_concise_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.sqlite")
+    database.init_db()
+    database.save_mail_settings(
+        enabled="true",
+        smtp_host="smtp.example.com",
+        smtp_port="587",
+        smtp_username="user@example.com",
+        smtp_password="secret",
+        from_address="noreply@example.com",
+        to_addresses="ops@example.com",
+        smtp_security="tls",
+        notify_on_success="true",
+        notify_on_failure="true",
+    )
+    task_id = database.create_task("https://www.youtube.com/watch?v=biliemail", task_id="biliemail")
+    job_id = database.create_bilibili_upload_job(task_id, title="投稿标题", publish_mode="now")
+    database.update_bilibili_upload_job(job_id, status="failed", error_message="上传失败")
+    sent: list[tuple[str, str]] = []
+
+    def capture_send(settings, subject, body):
+        sent.append((subject, body))
+
+    monkeypatch.setattr(notifications, "send_mail", capture_send)
+
+    assert notifications.send_bilibili_upload_notification(database.get_bilibili_upload_job(job_id)) == "sent"
+    assert sent == [("YouDub 投稿结果: 投稿标题", "标题: 投稿标题\n投稿结果: 投稿失败: 上传失败\n")]

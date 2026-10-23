@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import traceback
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from time import monotonic
 from typing import Callable
@@ -31,6 +32,7 @@ class PipelineArtifacts:
     timings_file: Path | None = None
     final_video: Path | None = None
     concatenated_video: Path | None = None
+    trim_source_video: Path | None = None
     trimmed_video: Path | None = None
 
 
@@ -160,7 +162,7 @@ class PipelineRunner:
         if database.get_active_bilibili_upload_job(self.task_id):
             self.log("[bilibili_upload] Auto publish skipped: upload job already active")
             return
-        title = (task.get("title") or "").strip()
+        title = (task.get("bilibili_upload_title") or task.get("title") or "").strip()
         if not title and task.get("session_path"):
             metadata = Path(task["session_path"]) / "metadata" / "ytdlp_info.json"
             if metadata.exists():
@@ -172,13 +174,44 @@ class PipelineRunner:
             title = task["id"]
         from . import bilibili_uploads
 
+        publish_mode = (task.get("bilibili_publish_mode") or "now").strip().lower()
+        dtime = (task.get("bilibili_dtime") or "").strip() or None
+        upload_after = (task.get("bilibili_upload_after") or "").strip() or None
+        if upload_after:
+            try:
+                if datetime.fromisoformat(upload_after) <= datetime.fromisoformat(database.now_iso()):
+                    upload_after = None
+            except ValueError:
+                upload_after = None
+        if publish_mode != "scheduled":
+            publish_mode = "now"
+            dtime = None
+
         job_id = database.create_bilibili_upload_job(
             self.task_id,
             title=title,
-            publish_mode="now",
+            description=task.get("bilibili_upload_description"),
+            tags=task.get("bilibili_upload_tags"),
+            tid=task.get("bilibili_upload_tid"),
+            topic_name=task.get("bilibili_topic_name"),
+            topic_id=task.get("bilibili_topic_id"),
+            topic_mission_id=task.get("bilibili_topic_mission_id"),
+            season_id=task.get("bilibili_season_id"),
+            section_id=task.get("bilibili_section_id"),
+            publish_mode=publish_mode,
+            dtime=dtime,
+            upload_after=upload_after,
         )
-        bilibili_uploads.enqueue(job_id)
-        self.log(f"[bilibili_upload] Auto publish queued: {job_id}")
+        from .bilibili_cover import snapshot_cover_for_job
+
+        cover_path = snapshot_cover_for_job(task.get("session_path") or "", job_id)
+        if cover_path:
+            database.update_bilibili_upload_job(job_id, cover_path=cover_path)
+        if upload_after:
+            self.log(f"[bilibili_upload] Auto publish scheduled: {job_id} at {upload_after}")
+        else:
+            bilibili_uploads.enqueue(job_id)
+            self.log(f"[bilibili_upload] Auto publish queued: {job_id}")
 
     def log(self, message: str) -> None:
         _write_log(self.task_id, message)
@@ -354,7 +387,27 @@ class PipelineRunner:
         self.artifacts.session = session
         self.artifacts.video_file = session / "media" / "video_source.mp4"
         title = (info.get("title") or "").strip() or None
-        database.update_task(self.task_id, session_path=str(session), title=title)
+        updates = {"session_path": str(session), "title": title}
+        from scripts.upload_bilibili import author_name, author_upload_config
+
+        bilibili_settings = database.get_bilibili_settings()
+        profile = author_upload_config(
+            bilibili_settings["author_config_json"],
+            legacy_tags_json=bilibili_settings["author_tags_json"],
+            legacy_tids_json=bilibili_settings["author_tids_json"],
+        ).get(author_name(info), {})
+        if not any(task.get(key) is not None for key in ("bilibili_topic_name", "bilibili_topic_id", "bilibili_topic_mission_id")):
+            updates.update(
+                bilibili_topic_name=profile.get("topic_name") or None,
+                bilibili_topic_id=profile.get("topic_id"),
+                bilibili_topic_mission_id=profile.get("topic_mission_id"),
+            )
+        if task.get("bilibili_season_id") is None and task.get("bilibili_section_id") is None:
+            updates.update(
+                bilibili_season_id=profile.get("season_id"),
+                bilibili_section_id=profile.get("section_id"),
+            )
+        database.update_task(self.task_id, **updates)
         self.stage_message("download", f"[{source.name}] {title or 'Downloaded'} -> {session}")
 
     def _separate(self, _: dict) -> None:
@@ -580,7 +633,7 @@ class PipelineRunner:
 
         session = _require(self.artifacts.session, "session")
         final_video = _require(
-            self.artifacts.concatenated_video or self._concat_source_video(session),
+            self.artifacts.trim_source_video or self.artifacts.concatenated_video or self._concat_source_video(session),
             "final_video",
         )
 
