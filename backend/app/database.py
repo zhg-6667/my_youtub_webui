@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import json
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,11 +40,25 @@ def init_db() -> None:
               current_stage TEXT,
               session_path TEXT,
               final_video_path TEXT,
+              cut_intervals_json TEXT,
               error_message TEXT,
               created_at TEXT NOT NULL,
               started_at TEXT,
               completed_at TEXT,
-              execution_mode TEXT NOT NULL DEFAULT 'auto'
+              execution_mode TEXT NOT NULL DEFAULT 'auto',
+              auto_bilibili_upload INTEGER NOT NULL DEFAULT 0,
+              bilibili_upload_title TEXT,
+              bilibili_upload_description TEXT,
+              bilibili_upload_tags TEXT,
+              bilibili_upload_tid INTEGER,
+              bilibili_topic_name TEXT,
+              bilibili_topic_id INTEGER,
+              bilibili_topic_mission_id INTEGER,
+              bilibili_season_id INTEGER,
+              bilibili_section_id INTEGER,
+              bilibili_publish_mode TEXT NOT NULL DEFAULT 'now',
+              bilibili_dtime TEXT,
+              bilibili_upload_after TEXT
             );
 
             CREATE TABLE IF NOT EXISTS task_stages (
@@ -69,8 +85,20 @@ def init_db() -> None:
               id TEXT PRIMARY KEY,
               task_id TEXT NOT NULL,
               title TEXT NOT NULL,
+              description TEXT,
+              tags TEXT,
+              tid INTEGER,
+              topic_name TEXT,
+              topic_id INTEGER,
+              topic_mission_id INTEGER,
               publish_mode TEXT NOT NULL,
               dtime TEXT,
+              upload_after TEXT,
+              cover_path TEXT,
+              season_id INTEGER,
+              section_id INTEGER,
+              aid INTEGER,
+              bvid TEXT,
               status TEXT NOT NULL,
               log_path TEXT,
               error_message TEXT,
@@ -79,6 +107,14 @@ def init_db() -> None:
               started_at TEXT,
               completed_at TEXT,
               FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS bilibili_publish_batches (
+              id TEXT PRIMARY KEY,
+              status TEXT NOT NULL DEFAULT 'draft',
+              preview_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              confirmed_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS watermark_mask_jobs (
@@ -96,6 +132,42 @@ def init_db() -> None:
               started_at TEXT,
               completed_at TEXT,
               FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS video_link_records (
+              id TEXT PRIMARY KEY,
+              url TEXT NOT NULL,
+              duration_seconds INTEGER,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              last_task_id TEXT,
+              FOREIGN KEY (last_task_id) REFERENCES tasks(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS youtube_channel_monitors (
+              id TEXT PRIMARY KEY,
+              channel_url TEXT NOT NULL,
+              channel_id TEXT NOT NULL,
+              title TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              check_interval_minutes INTEGER NOT NULL DEFAULT 30,
+              latest_count INTEGER NOT NULL DEFAULT 2,
+              last_checked_at TEXT,
+              last_error TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS youtube_channel_seen_videos (
+              monitor_id TEXT NOT NULL,
+              video_id TEXT NOT NULL,
+              url TEXT NOT NULL,
+              title TEXT,
+              duration_seconds INTEGER,
+              published_at TEXT,
+              discovered_at TEXT NOT NULL,
+              PRIMARY KEY (monitor_id, video_id),
+              FOREIGN KEY (monitor_id) REFERENCES youtube_channel_monitors(id) ON DELETE CASCADE
             );
             """
         )
@@ -122,9 +194,97 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'auto'"
             )
+        if "cut_intervals_json" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN cut_intervals_json TEXT")
+        if "auto_bilibili_upload" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN auto_bilibili_upload INTEGER NOT NULL DEFAULT 0")
+        if "bilibili_upload_title" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_upload_title TEXT")
+        if "bilibili_upload_description" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_upload_description TEXT")
+        if "bilibili_upload_tags" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_upload_tags TEXT")
+        if "bilibili_upload_tid" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_upload_tid INTEGER")
+        if "bilibili_topic_name" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_topic_name TEXT")
+        if "bilibili_topic_id" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_topic_id INTEGER")
+        if "bilibili_topic_mission_id" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_topic_mission_id INTEGER")
+        if "bilibili_season_id" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_season_id INTEGER")
+        if "bilibili_section_id" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_section_id INTEGER")
+        if "bilibili_publish_mode" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_publish_mode TEXT NOT NULL DEFAULT 'now'")
+        if "bilibili_dtime" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_dtime TEXT")
+        if "bilibili_upload_after" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN bilibili_upload_after TEXT")
         stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_stages)").fetchall()}
         if "progress" not in stage_columns:
             conn.execute("ALTER TABLE task_stages ADD COLUMN progress INTEGER")
+        video_link_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(video_link_records)").fetchall()
+        }
+        if "duration_seconds" not in video_link_columns:
+            conn.execute("ALTER TABLE video_link_records ADD COLUMN duration_seconds INTEGER")
+        monitor_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(youtube_channel_monitors)").fetchall()
+        }
+        if "latest_count" not in monitor_columns:
+            conn.execute("ALTER TABLE youtube_channel_monitors ADD COLUMN latest_count INTEGER NOT NULL DEFAULT 2")
+        seen_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(youtube_channel_seen_videos)").fetchall()
+        }
+        if "duration_seconds" not in seen_columns:
+            conn.execute("ALTER TABLE youtube_channel_seen_videos ADD COLUMN duration_seconds INTEGER")
+        bilibili_upload_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(bilibili_upload_jobs)").fetchall()
+        }
+        for column, sql_type in (
+            ("batch_id", "TEXT"), ("batch_position", "INTEGER"),
+            ("video_path", "TEXT"), ("video_fingerprint", "TEXT"),
+        ):
+            if column not in bilibili_upload_columns:
+                conn.execute(f"ALTER TABLE bilibili_upload_jobs ADD COLUMN {column} {sql_type}")
+        conn.execute("CREATE INDEX IF NOT EXISTS bilibili_upload_task_idx ON bilibili_upload_jobs(task_id, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS bilibili_upload_batch_idx ON bilibili_upload_jobs(batch_id)")
+        if "cover_path" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN cover_path TEXT")
+        if "upload_after" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN upload_after TEXT")
+        if "description" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN description TEXT")
+        if "tags" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN tags TEXT")
+        if "tid" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN tid INTEGER")
+        if "topic_name" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN topic_name TEXT")
+        if "topic_id" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN topic_id INTEGER")
+        if "topic_mission_id" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN topic_mission_id INTEGER")
+        if "season_id" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN season_id INTEGER")
+        if "section_id" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN section_id INTEGER")
+        if "aid" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN aid INTEGER")
+        if "bvid" not in bilibili_upload_columns:
+            conn.execute("ALTER TABLE bilibili_upload_jobs ADD COLUMN bvid TEXT")
+        task_ids = [row["id"] for row in conn.execute("SELECT id FROM tasks").fetchall()]
+        for task_id in task_ids:
+            for stage in STAGES:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_stages (task_id, name, label, status)
+                    VALUES (?, ?, ?, 'pending')
+                    """,
+                    (task_id, stage.name, stage.label),
+                )
 
 
 def backfill_titles_from_metadata() -> None:
@@ -184,6 +344,11 @@ def create_task(
     task_id: str | None = None,
     *,
     execution_mode: str = DEFAULT_EXECUTION_MODE,
+    auto_bilibili_upload: bool = False,
+    bilibili_upload_title: str | None = None,
+    bilibili_publish_mode: str = "now",
+    bilibili_dtime: str | None = None,
+    bilibili_upload_after: str | None = None,
 ) -> str:
     new_id = task_id or str(uuid.uuid4())
     created_at = now_iso()
@@ -191,10 +356,24 @@ def create_task(
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO tasks (id, url, status, current_stage, created_at, execution_mode)
-            VALUES (?, ?, 'queued', ?, ?, ?)
+            INSERT INTO tasks (
+              id, url, status, current_stage, created_at, execution_mode,
+              auto_bilibili_upload, bilibili_upload_title, bilibili_publish_mode,
+              bilibili_dtime, bilibili_upload_after
+            ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (new_id, url, STAGES[0].name, created_at, mode),
+            (
+                new_id,
+                url,
+                STAGES[0].name,
+                created_at,
+                mode,
+                1 if auto_bilibili_upload else 0,
+                bilibili_upload_title,
+                bilibili_publish_mode,
+                bilibili_dtime,
+                bilibili_upload_after,
+            ),
         )
         conn.executemany(
             """
@@ -234,12 +413,29 @@ def latest_task_id() -> str | None:
 def list_tasks(limit: int = 100) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
-            "SELECT id, url, title, status, current_stage, final_video_path, error_message, "
-            "created_at, started_at, completed_at, execution_mode FROM tasks "
+            "SELECT id, url, title, status, current_stage, session_path, final_video_path, error_message, "
+            "created_at, started_at, completed_at, execution_mode, auto_bilibili_upload, "
+            "bilibili_upload_title, bilibili_topic_name, bilibili_topic_id, "
+            "bilibili_topic_mission_id, bilibili_season_id, bilibili_section_id, "
+            "bilibili_publish_mode, bilibili_dtime, bilibili_upload_after FROM tasks "
             "ORDER BY created_at DESC, rowid DESC LIMIT ?",
             (limit,),
         ).fetchall()
-    return [dict(row) for row in rows]
+        summaries = {
+            row["task_id"]: dict(row) for row in conn.execute(
+                """SELECT j.task_id, j.status AS bilibili_upload_status,
+                   j.dtime AS bilibili_scheduled_publish_at, j.batch_id AS bilibili_batch_id,
+                   EXISTS(SELECT 1 FROM bilibili_upload_jobs b WHERE b.task_id = j.task_id
+                     AND b.status IN ('scheduled', 'queued', 'running', 'succeeded')) AS bilibili_upload_blocked
+                   FROM bilibili_upload_jobs j WHERE j.task_id IN (
+                     SELECT id FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT ?)
+                   AND j.rowid = (
+                     SELECT rowid FROM bilibili_upload_jobs latest WHERE latest.task_id = j.task_id
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1)""", (limit,)
+            ).fetchall()
+        }
+    return [{**dict(row), **{key: value for key, value in summaries.get(row["id"], {}).items()
+                            if key != "task_id"}} for row in rows]
 
 
 def get_task(task_id: str) -> dict[str, Any] | None:
@@ -262,6 +458,8 @@ def get_task(task_id: str) -> dict[str, Any] | None:
                 WHEN 'tts' THEN 7
                 WHEN 'merge_audio' THEN 8
                 WHEN 'merge_video' THEN 9
+                WHEN 'concat_video' THEN 10
+                WHEN 'trim_video' THEN 11
                 ELSE 99
               END
             """,
@@ -358,6 +556,194 @@ def update_task(task_id: str, **fields: Any) -> None:
         conn.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", values)
 
 
+def upsert_video_link_record(
+    url: str, record_id: str | None = None, *, duration_seconds: int | None = None
+) -> dict[str, Any]:
+    new_id = record_id or str(uuid.uuid4())
+    updated_at = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO video_link_records (id, url, duration_seconds, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              url = excluded.url,
+              duration_seconds = COALESCE(excluded.duration_seconds, video_link_records.duration_seconds),
+              updated_at = excluded.updated_at
+            """,
+            (new_id, url, duration_seconds, updated_at, updated_at),
+        )
+        row = conn.execute("SELECT * FROM video_link_records WHERE id = ?", (new_id,)).fetchone()
+    return dict(row)
+
+
+def list_video_link_records(limit: int = 100) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, url, duration_seconds, created_at, updated_at, last_task_id
+            FROM video_link_records
+            ORDER BY updated_at DESC, rowid DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_video_link_record(record_id: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute("DELETE FROM video_link_records WHERE id = ?", (record_id,))
+        return cursor.rowcount > 0
+
+
+def mark_video_link_record_task(record_id: str, task_id: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE video_link_records SET last_task_id = ?, updated_at = ? WHERE id = ?",
+            (task_id, now_iso(), record_id),
+        )
+
+
+def create_youtube_channel_monitor(
+    *,
+    channel_url: str,
+    channel_id: str,
+    title: str | None = None,
+    enabled: bool = True,
+    check_interval_minutes: int = 30,
+    latest_count: int = 2,
+) -> dict[str, Any]:
+    monitor_id = str(uuid.uuid4())
+    created_at = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO youtube_channel_monitors (
+              id, channel_url, channel_id, title, enabled, check_interval_minutes,
+              latest_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                monitor_id,
+                channel_url,
+                channel_id,
+                title,
+                1 if enabled else 0,
+                check_interval_minutes,
+                latest_count,
+                created_at,
+                created_at,
+            ),
+        )
+        row = conn.execute("SELECT * FROM youtube_channel_monitors WHERE id = ?", (monitor_id,)).fetchone()
+    return dict(row)
+
+
+def list_youtube_channel_monitors() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM youtube_channel_monitors
+            ORDER BY created_at DESC, rowid DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_enabled_youtube_channel_monitors() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM youtube_channel_monitors
+            WHERE enabled = 1
+            ORDER BY created_at ASC, rowid ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_youtube_channel_monitor(monitor_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM youtube_channel_monitors WHERE id = ?", (monitor_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_youtube_channel_monitor(monitor_id: str, **fields: Any) -> dict[str, Any] | None:
+    if fields:
+        fields["updated_at"] = now_iso()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [monitor_id]
+        with connect() as conn:
+            conn.execute(f"UPDATE youtube_channel_monitors SET {assignments} WHERE id = ?", values)
+    return get_youtube_channel_monitor(monitor_id)
+
+
+def delete_youtube_channel_monitor(monitor_id: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute("DELETE FROM youtube_channel_monitors WHERE id = ?", (monitor_id,))
+        return cursor.rowcount > 0
+
+
+def has_seen_youtube_channel_video(monitor_id: str, video_id: str) -> bool:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM youtube_channel_seen_videos
+            WHERE monitor_id = ? AND video_id = ?
+            LIMIT 1
+            """,
+            (monitor_id, video_id),
+        ).fetchone()
+    return row is not None
+
+
+def mark_youtube_channel_video_seen(
+    *,
+    monitor_id: str,
+    video_id: str,
+    url: str,
+    title: str | None = None,
+    duration_seconds: int | None = None,
+    published_at: str | None = None,
+) -> None:
+    discovered_at = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO youtube_channel_seen_videos (
+              monitor_id, video_id, url, title, duration_seconds, published_at, discovered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (monitor_id, video_id, url, title, duration_seconds, published_at, discovered_at),
+        )
+
+
+def update_youtube_channel_monitor_check(
+    monitor_id: str, *, last_error: str | None = None
+) -> dict[str, Any] | None:
+    return update_youtube_channel_monitor(
+        monitor_id,
+        last_checked_at=now_iso(),
+        last_error=last_error,
+    )
+
+
+def get_task_cut_intervals(task_id: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute("SELECT cut_intervals_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row["cut_intervals_json"] if row else None
+
+
+def save_task_cut_intervals(task_id: str, intervals_json: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET cut_intervals_json = ? WHERE id = ?",
+            (intervals_json, task_id),
+        )
+
+
 def update_stage(task_id: str, name: str, **fields: Any) -> None:
     if not fields:
         return
@@ -431,6 +817,45 @@ def save_ytdlp_settings(proxy_port: str) -> None:
     set_setting("ytdlp.proxy_port", proxy_port.strip())
 
 
+def _merged_bilibili_author_config(author_tags_json: str, author_tids_json: str) -> str:
+    merged: dict[str, dict[str, str | int]] = {}
+    if author_tags_json.strip():
+        for author, tags in json.loads(author_tags_json).items():
+            merged.setdefault(author, {})["tags"] = tags
+    if author_tids_json.strip():
+        for author, tid in json.loads(author_tids_json).items():
+            merged.setdefault(author, {})["tid"] = tid
+    return json.dumps(merged, ensure_ascii=False) if merged else ""
+
+
+def get_bilibili_settings() -> dict[str, str]:
+    author_config_json = get_setting("bilibili.author_config_json", "")
+    author_tags_json = get_setting("bilibili.author_tags_json", "")
+    author_tids_json = get_setting("bilibili.author_tids_json", "")
+    pokemon_topic_config_json = get_setting("bilibili.pokemon_topic_config_json", "")
+    if not author_config_json.strip():
+        author_config_json = _merged_bilibili_author_config(author_tags_json, author_tids_json)
+    return {
+        "author_config_json": author_config_json,
+        "author_tags_json": author_tags_json,
+        "author_tids_json": author_tids_json,
+        "pokemon_topic_config_json": pokemon_topic_config_json,
+    }
+
+
+def save_bilibili_settings(
+    author_tags_json: str = "",
+    author_tids_json: str = "",
+    *,
+    author_config_json: str = "",
+    pokemon_topic_config_json: str = "",
+) -> None:
+    set_setting("bilibili.author_config_json", author_config_json.strip())
+    set_setting("bilibili.author_tags_json", author_tags_json.strip())
+    set_setting("bilibili.author_tids_json", author_tids_json.strip())
+    set_setting("bilibili.pokemon_topic_config_json", pokemon_topic_config_json.strip())
+
+
 def get_mail_settings() -> dict[str, str]:
     defaults = mail_defaults()
     return {
@@ -484,7 +909,11 @@ def log_path(task_id: str) -> Path:
     return LOG_DIR / f"{task_id}.log"
 
 
-BILIBILI_UPLOAD_ACTIVE_STATUSES = ("queued", "running")
+BILIBILI_UPLOAD_ACTIVE_STATUSES = ("scheduled", "queued", "running")
+
+
+class BilibiliUploadConflict(ValueError):
+    pass
 
 
 def bilibili_upload_log_path(job_id: str) -> Path:
@@ -497,22 +926,80 @@ def create_bilibili_upload_job(
     task_id: str,
     *,
     title: str,
+    description: str | None = None,
+    tags: str | None = None,
+    tid: int | None = None,
+    topic_name: str | None = None,
+    topic_id: int | None = None,
+    topic_mission_id: int | None = None,
     publish_mode: str,
     dtime: str | None = None,
+    upload_after: str | None = None,
+    cover_path: str | None = None,
+    season_id: int | None = None,
+    section_id: int | None = None,
     job_id: str | None = None,
+    batch_id: str | None = None,
+    batch_position: int | None = None,
+    video_path: str | None = None,
+    video_fingerprint: str | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> str:
     new_id = job_id or str(uuid.uuid4())
     log = bilibili_upload_log_path(new_id)
-    with connect() as conn:
+    status = "scheduled" if upload_after else "queued"
+    with (connect() if connection is None else nullcontext(connection)) as conn:
+        if connection is None:
+            conn.execute("BEGIN IMMEDIATE")
+        if conn.execute(
+            "SELECT 1 FROM bilibili_upload_jobs WHERE task_id = ? AND status IN ('scheduled', 'queued', 'running')",
+            (task_id,),
+        ).fetchone():
+            raise BilibiliUploadConflict("该任务已有待上传或上传中的投稿。")
         conn.execute(
             """
             INSERT INTO bilibili_upload_jobs (
-              id, task_id, title, publish_mode, dtime, status, log_path, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+              id, task_id, title, description, tags, tid, topic_name, topic_id,
+              topic_mission_id, publish_mode, dtime, upload_after, cover_path,
+              season_id, section_id, status, log_path, created_at,
+              batch_id, batch_position, video_path, video_fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (new_id, task_id, title, publish_mode, dtime, str(log), now_iso()),
+            (
+                new_id,
+                task_id,
+                title,
+                description,
+                tags,
+                tid,
+                topic_name,
+                topic_id,
+                topic_mission_id,
+                publish_mode,
+                dtime,
+                upload_after,
+                cover_path,
+                season_id,
+                section_id,
+                status,
+                str(log),
+                now_iso(),
+                batch_id,
+                batch_position,
+                video_path,
+                video_fingerprint,
+            ),
         )
     return new_id
+
+
+def claim_bilibili_upload_job(job_id: str) -> bool:
+    """Claim atomically so cancellation and duplicate queue delivery cannot start an upload."""
+    with connect() as conn:
+        return conn.execute(
+            "UPDATE bilibili_upload_jobs SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'",
+            (now_iso(), job_id),
+        ).rowcount == 1
 
 
 def get_bilibili_upload_job(job_id: str) -> dict[str, Any] | None:
@@ -540,6 +1027,31 @@ def list_queued_bilibili_upload_jobs() -> list[dict[str, Any]]:
             "SELECT * FROM bilibili_upload_jobs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def queue_due_scheduled_bilibili_upload_jobs() -> list[dict[str, Any]]:
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        due = conn.execute(
+            """
+            SELECT * FROM bilibili_upload_jobs
+            WHERE status = 'scheduled' AND (
+                batch_id IS NOT NULL OR (upload_after IS NOT NULL AND upload_after <= ?)
+            )
+            ORDER BY upload_after ASC, created_at ASC, rowid ASC
+            """,
+            (now_iso(),),
+        ).fetchall()
+        job_ids = [row["id"] for row in due]
+        if job_ids:
+            placeholders = ",".join("?" for _ in job_ids)
+            conn.execute(
+                f"""UPDATE bilibili_upload_jobs SET status = 'queued',
+                    upload_after = CASE WHEN batch_id IS NOT NULL THEN NULL ELSE upload_after END
+                    WHERE id IN ({placeholders})""",
+                job_ids,
+            )
+    return [dict(row) for row in due]
 
 
 def fail_stale_running_bilibili_upload_jobs() -> None:

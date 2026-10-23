@@ -8,15 +8,26 @@ from .stages import STAGE_NAMES
 
 
 STAGE_OWN_ARTIFACTS: dict[str, tuple[str, ...]] = {
-    "download": ("media", "metadata", "segments", "tmp"),
+    "download": ("media", "metadata", "segments", "tmp", "cover.jpg"),
     "separate": ("media/audio_vocals.wav", "media/audio_bgm.wav"),
     "asr": ("metadata/asr.json",),
     "asr_fix": ("metadata/asr_fixed.json",),
     "translate": ("metadata/translation_preprocess.json",),
     "split_audio": ("segments/vocals",),
     "tts": ("segments/tts",),
-    "merge_audio": ("tmp/audio_dubbing.wav", "metadata/timings.json", "segments/stretched"),
+    "merge_audio": ("tmp/audio_dubbing.wav", "metadata/timings.json", "segments/stretched", "segments/trimmed"),
     "merge_video": ("tmp/audio_mixed.m4a", "media/video_final.mp4"),
+    "concat_video": (
+        "tmp/cta_follow_1s.mp4",
+        "tmp/cta_follow_2s.mp4",
+        "tmp/cta_follow_line1.txt",
+        "tmp/cta_follow_line2.txt",
+        "tmp/concat_video.txt",
+        "tmp/video_final_with_cta.tmp.mp4",
+        "media/cta_follow_1s.mp4",
+        "media/cta_follow_2s.mp4",
+        "media/video_final_with_cta.mp4",
+    ),
     "trim_video": ("media/video_final_trimmed.mp4",),
 }
 

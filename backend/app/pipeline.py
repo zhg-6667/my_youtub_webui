@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import traceback
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from time import monotonic
 from typing import Callable
@@ -11,7 +12,7 @@ from . import database
 from .config import WORKFOLDER
 from .devices import device_plan_summary
 from .runtime_checks import validate_runtime_device
-from .sources import detect_source
+from .sources import detect_source, should_skip_cta_concat
 from .stages import STAGES
 from .youtube import is_local_upload_url
 
@@ -30,6 +31,8 @@ class PipelineArtifacts:
     dubbing_file: Path | None = None
     timings_file: Path | None = None
     final_video: Path | None = None
+    concatenated_video: Path | None = None
+    trim_source_video: Path | None = None
     trimmed_video: Path | None = None
 
 
@@ -69,6 +72,7 @@ class PipelineRunner:
             "tts": self._tts,
             "merge_audio": self._merge_audio,
             "merge_video": self._merge_video,
+            "concat_video": self._concat_video,
             "trim_video": self._trim_video,
         }
 
@@ -111,10 +115,18 @@ class PipelineRunner:
                 self.task_id,
                 status="succeeded",
                 current_stage="done",
-                final_video_path=str(_require(self.artifacts.trimmed_video or self.artifacts.final_video, "final_video")),
+                final_video_path=str(
+                    _require(
+                        self.artifacts.trimmed_video
+                        or self.artifacts.concatenated_video
+                        or self.artifacts.final_video,
+                        "final_video",
+                    )
+                ),
                 completed_at=database.now_iso(),
             )
             self.log("Task succeeded")
+            self._maybe_enqueue_auto_bilibili_upload()
             self._notify_task_completion("succeeded")
         except Exception as exc:
             current = database.get_task(self.task_id)
@@ -142,6 +154,64 @@ class PipelineRunner:
         from .notifications import notify_task_completion
 
         notify_task_completion(self.task_id, event, self.log)
+
+    def _maybe_enqueue_auto_bilibili_upload(self) -> None:
+        task = database.get_task(self.task_id)
+        if not task or not task.get("auto_bilibili_upload"):
+            return
+        if database.get_active_bilibili_upload_job(self.task_id):
+            self.log("[bilibili_upload] Auto publish skipped: upload job already active")
+            return
+        title = (task.get("bilibili_upload_title") or task.get("title") or "").strip()
+        if not title and task.get("session_path"):
+            metadata = Path(task["session_path"]) / "metadata" / "ytdlp_info.json"
+            if metadata.exists():
+                try:
+                    title = (json.loads(metadata.read_text(encoding="utf-8")).get("title") or "").strip()
+                except (OSError, json.JSONDecodeError):
+                    title = ""
+        if not title:
+            title = task["id"]
+        from . import bilibili_uploads
+
+        publish_mode = (task.get("bilibili_publish_mode") or "now").strip().lower()
+        dtime = (task.get("bilibili_dtime") or "").strip() or None
+        upload_after = (task.get("bilibili_upload_after") or "").strip() or None
+        if upload_after:
+            try:
+                if datetime.fromisoformat(upload_after) <= datetime.fromisoformat(database.now_iso()):
+                    upload_after = None
+            except ValueError:
+                upload_after = None
+        if publish_mode != "scheduled":
+            publish_mode = "now"
+            dtime = None
+
+        job_id = database.create_bilibili_upload_job(
+            self.task_id,
+            title=title,
+            description=task.get("bilibili_upload_description"),
+            tags=task.get("bilibili_upload_tags"),
+            tid=task.get("bilibili_upload_tid"),
+            topic_name=task.get("bilibili_topic_name"),
+            topic_id=task.get("bilibili_topic_id"),
+            topic_mission_id=task.get("bilibili_topic_mission_id"),
+            season_id=task.get("bilibili_season_id"),
+            section_id=task.get("bilibili_section_id"),
+            publish_mode=publish_mode,
+            dtime=dtime,
+            upload_after=upload_after,
+        )
+        from .bilibili_cover import snapshot_cover_for_job
+
+        cover_path = snapshot_cover_for_job(task.get("session_path") or "", job_id)
+        if cover_path:
+            database.update_bilibili_upload_job(job_id, cover_path=cover_path)
+        if upload_after:
+            self.log(f"[bilibili_upload] Auto publish scheduled: {job_id} at {upload_after}")
+        else:
+            bilibili_uploads.enqueue(job_id)
+            self.log(f"[bilibili_upload] Auto publish queued: {job_id}")
 
     def log(self, message: str) -> None:
         _write_log(self.task_id, message)
@@ -265,10 +335,38 @@ class PipelineRunner:
             self.artifacts.timings_file = _require_existing(session / "metadata" / "timings.json", "timings_file")
             return
         if stage == "merge_video":
-            self.artifacts.final_video = _require_existing(session / "media" / "video_final.mp4", "final_video")
+            final_video = session / "media" / "video_final.mp4"
+            if final_video.exists():
+                self.artifacts.final_video = final_video
+            else:
+                self.artifacts.video_file = _require_existing(session / "media" / "video_source.mp4", "video_file")
+            return
+        if stage == "concat_video":
+            source = detect_source(task["url"])
+            final_video = session / "media" / "video_final.mp4"
+            if final_video.exists():
+                self.artifacts.final_video = final_video
+                input_video = final_video
+            else:
+                input_video = _require_existing(session / "media" / "video_source.mp4", "video_file")
+                self.artifacts.video_file = input_video
+            if should_skip_cta_concat(source):
+                self.artifacts.concatenated_video = input_video
+            else:
+                self.artifacts.concatenated_video = _require_existing(
+                    session / "media" / "video_final_with_cta.mp4",
+                    "concatenated_video",
+                )
             return
         if stage == "trim_video":
-            self.artifacts.final_video = _require_existing(session / "media" / "video_final.mp4", "final_video")
+            final_video = session / "media" / "video_final.mp4"
+            if final_video.exists():
+                self.artifacts.final_video = final_video
+            else:
+                self.artifacts.video_file = _require_existing(session / "media" / "video_source.mp4", "video_file")
+            concatenated = session / "media" / "video_final_with_cta.mp4"
+            if concatenated.exists():
+                self.artifacts.concatenated_video = concatenated
             trimmed = session / "media" / "video_final_trimmed.mp4"
             if trimmed.exists():
                 self.artifacts.trimmed_video = trimmed
@@ -289,7 +387,27 @@ class PipelineRunner:
         self.artifacts.session = session
         self.artifacts.video_file = session / "media" / "video_source.mp4"
         title = (info.get("title") or "").strip() or None
-        database.update_task(self.task_id, session_path=str(session), title=title)
+        updates = {"session_path": str(session), "title": title}
+        from scripts.upload_bilibili import author_name, author_upload_config
+
+        bilibili_settings = database.get_bilibili_settings()
+        profile = author_upload_config(
+            bilibili_settings["author_config_json"],
+            legacy_tags_json=bilibili_settings["author_tags_json"],
+            legacy_tids_json=bilibili_settings["author_tids_json"],
+        ).get(author_name(info), {})
+        if not any(task.get(key) is not None for key in ("bilibili_topic_name", "bilibili_topic_id", "bilibili_topic_mission_id")):
+            updates.update(
+                bilibili_topic_name=profile.get("topic_name") or None,
+                bilibili_topic_id=profile.get("topic_id"),
+                bilibili_topic_mission_id=profile.get("topic_mission_id"),
+            )
+        if task.get("bilibili_season_id") is None and task.get("bilibili_section_id") is None:
+            updates.update(
+                bilibili_season_id=profile.get("season_id"),
+                bilibili_section_id=profile.get("section_id"),
+            )
+        database.update_task(self.task_id, **updates)
         self.stage_message("download", f"[{source.name}] {title or 'Downloaded'} -> {session}")
 
     def _separate(self, _: dict) -> None:
@@ -473,15 +591,58 @@ class PipelineRunner:
         size_mb = self.artifacts.final_video.stat().st_size / (1024 * 1024)
         self.stage_message("merge_video", f"Final video: {self.artifacts.final_video} ({size_mb:.1f} MB)")
 
+    def _concat_source_video(self, session: Path) -> Path:
+        final_video = self.artifacts.final_video
+        if final_video and final_video.exists():
+            return final_video
+        cached_final = session / "media" / "video_final.mp4"
+        if cached_final.exists():
+            self.artifacts.final_video = cached_final
+            return cached_final
+        video_file = self.artifacts.video_file
+        if video_file and video_file.exists():
+            return video_file
+        source_video = _require_existing(session / "media" / "video_source.mp4", "video_file")
+        self.artifacts.video_file = source_video
+        return source_video
+
+    def _concat_video(self, task: dict) -> None:
+        session = _require(self.artifacts.session, "session")
+        input_video = self._concat_source_video(session)
+        source = detect_source(task["url"])
+        if should_skip_cta_concat(source):
+            self.artifacts.concatenated_video = input_video
+            self.stage_message(
+                "concat_video",
+                f"Skipped CTA prepend for {source.asr_language}->{source.target_language}: {input_video}",
+            )
+            return
+        from .adapters.ffmpeg import prepend_cta_clip
+
+        self.artifacts.concatenated_video = prepend_cta_clip(input_video, session)
+        size_mb = self.artifacts.concatenated_video.stat().st_size / (1024 * 1024)
+        self.stage_message(
+            "concat_video",
+            f"Prepended CTA clip to {input_video.name}: {self.artifacts.concatenated_video} ({size_mb:.1f} MB)",
+        )
+
     def _trim_video(self, _: dict) -> None:
         import json as _json
 
         from .adapters.ffmpeg import trim_video
 
         session = _require(self.artifacts.session, "session")
-        final_video = _require(self.artifacts.final_video, "final_video")
+        final_video = _require(
+            self.artifacts.trim_source_video or self.artifacts.concatenated_video or self._concat_source_video(session),
+            "final_video",
+        )
 
         intervals_file = session / "metadata" / "cut_intervals.json"
+        if not intervals_file.exists():
+            saved_intervals = database.get_task_cut_intervals(self.task_id)
+            if saved_intervals:
+                intervals_file.parent.mkdir(parents=True, exist_ok=True)
+                intervals_file.write_text(saved_intervals, encoding="utf-8")
         if not intervals_file.exists():
             self.artifacts.trimmed_video = final_video
             self.stage_message("trim_video", "No cut intervals; keeping original video")

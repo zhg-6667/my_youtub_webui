@@ -45,6 +45,18 @@ def test_remove_stage_artifacts_keeps_upstream(tmp_path):
     assert not translation.exists()
 
 
+def test_remove_download_stage_artifacts_removes_cached_cover(tmp_path):
+    session = tmp_path / "session"
+    (session / "media").mkdir(parents=True)
+    cover = session / "cover.jpg"
+    cover.write_bytes(b"cover")
+
+    source = detect_source("https://www.youtube.com/watch?v=abcdefghijk")
+    remove_stage_artifacts(session, "download", source)
+
+    assert not cover.exists()
+
+
 def test_reset_stages_from_only_resets_downstream(monkeypatch, tmp_path):
     from backend.app import database
     from backend.tests.test_settings_and_api import configure_tmp_runtime

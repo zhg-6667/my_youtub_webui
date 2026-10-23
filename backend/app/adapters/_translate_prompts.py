@@ -67,6 +67,7 @@ _EN_TO_ZH_RULES = """你是一个专业的中文翻译助手。请将英文逐�
 - items 数组的长度必须与输入句数完全一致，顺序一一对应；即使某句很长，也只能对应一个元素，绝不能把一句拆成多个元素。
 - 每个元素只放该句中文译文本身，不要编号、不要解释、不要前后缀、不要引号、不要 markdown。
 - 不得输出除该 JSON 对象以外的任何字符。
+- 如果只有 1 行输入，也必须返回 JSON：{{"items": ["<该句中文译文>"]}}，绝不能返回「1. 译文」。
 """
 
 
@@ -102,6 +103,7 @@ Summary: {summary}
 - The items array length MUST exactly match the number of input sentences, in the same order; even a long sentence maps to exactly one element, never split one sentence into multiple elements.
 - Each element contains only that sentence's English translation, no numbering, labels, prefixes, quotes or markdown.
 - Output nothing other than that JSON object.
+- If there is only 1 input line, you must still return JSON: {{"items": ["<the English translation>"]}}, never "1. translation".
 """
 
 

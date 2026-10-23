@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -297,6 +298,350 @@ def _probe_duration(video_file: Path) -> float | None:
         return None
 
 
+CTA_CLIP_LINES = (
+    "如果你喜欢这些视频",
+    "请多多关注、一键三连，感谢！！",
+)
+CTA_CLIP_SECONDS = 1
+CTA_TEXT_MAX_WIDTH_RATIO = 0.88
+
+
+def _probe_concat_reference(video_file: Path) -> dict[str, str | int]:
+    result = subprocess.run(
+        [
+            ffprobe_binary(),
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,profile,level,pix_fmt,width,height,avg_frame_rate,time_base,sample_rate,channels,channel_layout",
+            "-of",
+            "json",
+            str(video_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    settings: dict[str, str | int] = {
+        "width": 1920,
+        "height": 1080,
+        "fps": "60/1",
+        "video_codec": "h264",
+        "profile": "Main",
+        "level": 42,
+        "pix_fmt": "yuv420p",
+        "time_base": "1/15360",
+        "audio_codec": "aac",
+        "sample_rate": 48000,
+        "channels": 1,
+        "channel_layout": "mono",
+    }
+    if result.returncode != 0:
+        return settings
+    try:
+        streams = json.loads(result.stdout).get("streams") or []
+    except json.JSONDecodeError:
+        return settings
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+    audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+    if video_stream.get("codec_name"):
+        settings["video_codec"] = str(video_stream["codec_name"])
+    if video_stream.get("profile"):
+        settings["profile"] = str(video_stream["profile"])
+    if video_stream.get("level"):
+        settings["level"] = int(video_stream["level"])
+    if video_stream.get("pix_fmt"):
+        settings["pix_fmt"] = str(video_stream["pix_fmt"])
+    if video_stream.get("width") and video_stream.get("height"):
+        settings["width"] = int(video_stream["width"])
+        settings["height"] = int(video_stream["height"])
+    fps = str(video_stream.get("avg_frame_rate") or "60/1")
+    if fps and fps != "0/0":
+        settings["fps"] = fps
+    if video_stream.get("time_base"):
+        settings["time_base"] = str(video_stream["time_base"])
+    if audio_stream.get("codec_name"):
+        settings["audio_codec"] = str(audio_stream["codec_name"])
+    if audio_stream.get("sample_rate"):
+        settings["sample_rate"] = int(audio_stream["sample_rate"])
+    if audio_stream.get("channels"):
+        settings["channels"] = int(audio_stream["channels"])
+    if audio_stream.get("channel_layout"):
+        settings["channel_layout"] = str(audio_stream["channel_layout"])
+    return settings
+
+
+def _filter_path(path: Path) -> str:
+    return path.resolve().as_posix().replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _drawtext_font_option() -> str:
+    configured = os.getenv("CTA_FONT_FILE", "").strip()
+    candidates = [configured] if configured else []
+    candidates.extend(
+        [
+            "C:/Windows/Fonts/msyhbd.ttc",
+            "C:/Windows/Fonts/msyh.ttc",
+        ]
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return f"fontfile='{_filter_path(Path(candidate))}'"
+    return "font='Noto Sans CJK SC'"
+
+
+def _channel_layout(channels: int) -> str:
+    if channels == 1:
+        return "mono"
+    if channels == 2:
+        return "stereo"
+    return "mono"
+
+
+def _concat_file_path(path: Path) -> str:
+    return path.resolve().as_posix().replace("'", "\\'")
+
+
+def _x264_profile(profile: str) -> str | None:
+    normalized = profile.strip().lower()
+    if "baseline" in normalized:
+        return "baseline"
+    if "main" in normalized:
+        return "main"
+    if "high" in normalized:
+        return "high"
+    return None
+
+
+def _ffmpeg_level(level: int | str) -> str | None:
+    try:
+        value = int(level)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return f"{value // 10}.{value % 10}"
+
+
+def _cta_video_encoder_args(settings: dict[str, str | int]) -> list[str]:
+    codec = str(settings.get("video_codec") or "h264").lower()
+    pix_fmt = str(settings.get("pix_fmt") or "yuv420p")
+    if pix_fmt.startswith("yuvj"):
+        pix_fmt = pix_fmt.replace("yuvj", "yuv", 1)
+    if pix_fmt not in {"yuv420p", "yuv422p", "yuv444p"}:
+        pix_fmt = "yuv420p"
+
+    if codec in {"h264", "avc1"}:
+        args = ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", pix_fmt]
+        profile = _x264_profile(str(settings.get("profile") or ""))
+        if profile:
+            args.extend(["-profile:v", profile])
+        level = _ffmpeg_level(settings.get("level") or 0)
+        if level:
+            args.extend(["-level:v", level])
+        return args
+
+    if codec in {"hevc", "h265"}:
+        return ["-c:v", "libx265", "-preset", "fast", "-crf", "26", "-pix_fmt", pix_fmt]
+
+    if codec == "av1":
+        return ["-c:v", "libsvtav1", "-preset", "8", "-crf", "35", "-pix_fmt", pix_fmt]
+
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"]
+
+
+def _cta_audio_encoder_args(settings: dict[str, str | int]) -> list[str]:
+    codec = str(settings.get("audio_codec") or "aac").lower()
+    sample_rate = str(settings.get("sample_rate") or 48000)
+    channels = str(settings.get("channels") or 1)
+    if codec == "opus":
+        return ["-c:a", "libopus", "-ar", sample_rate, "-ac", channels, "-b:a", "128k"]
+    if codec == "mp3":
+        return ["-c:a", "libmp3lame", "-ar", sample_rate, "-ac", channels]
+    return ["-c:a", "aac", "-ar", sample_rate, "-ac", channels]
+
+
+def _video_track_timescale(time_base: str | int) -> str | None:
+    raw = str(time_base)
+    if "/" not in raw:
+        return None
+    numerator, denominator = raw.split("/", 1)
+    try:
+        if int(numerator) != 1:
+            return None
+        value = int(denominator)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return str(value)
+
+
+def _text_width_units(text: str) -> float:
+    total = 0.0
+    for char in text:
+        if char.isspace():
+            total += 0.4
+        elif char.isascii():
+            total += 0.55
+        elif char in SUBTITLE_PUNCTUATION:
+            total += 0.5
+        else:
+            total += 1.0
+    return max(1.0, total)
+
+
+def _cta_lines_for_canvas(width: int, height: int) -> tuple[str, ...]:
+    if height <= width:
+        return CTA_CLIP_LINES
+    return (
+        CTA_CLIP_LINES[0],
+        "请多多关注、一键三连",
+        "感谢！！",
+    )
+
+
+def _cta_font_size(text: str, width: int, preferred_size: int, minimum_size: int) -> int:
+    max_by_width = round(width * CTA_TEXT_MAX_WIDTH_RATIO / _text_width_units(text))
+    return max(minimum_size, min(preferred_size, max_by_width))
+
+
+def _cta_text_filter(font: str, text_files: list[Path], width: int, height: int) -> str:
+    preferred_sizes = [round(height * 0.072), round(height * 0.063), round(height * 0.057)]
+    minimum_size = 22 if height > width else 32
+    sizes = [
+        _cta_font_size(path.read_text(encoding="utf-8"), width, max(36, preferred), minimum_size)
+        for path, preferred in zip(text_files, preferred_sizes, strict=False)
+    ]
+    line_gap = max(12, round(height * 0.028))
+    block_height = sum(sizes) + line_gap * (len(sizes) - 1)
+    y = round((height - block_height) / 2)
+    filters: list[str] = []
+    for path, size in zip(text_files, sizes, strict=True):
+        filters.append(
+            f"drawtext={font}:textfile='{_filter_path(path)}':fontsize={size}:"
+            f"fontcolor=white:x=(w-text_w)/2:y={y}"
+        )
+        y += size + line_gap
+    filters.append("format=yuv420p")
+    return ",".join(filters)
+
+
+def generate_cta_clip(reference_video: Path, session: Path) -> Path:
+    media_dir = session / "media"
+    tmp_dir = session / "tmp"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    clip = media_dir / "cta_follow_1s.mp4"
+    if clip.exists():
+        clip.unlink()
+
+    settings = _probe_concat_reference(reference_video)
+    width = int(settings["width"])
+    height = int(settings["height"])
+    fps = str(settings["fps"])
+    sample_rate = int(settings["sample_rate"])
+    channels = int(settings["channels"])
+    channel_layout = str(settings.get("channel_layout") or _channel_layout(channels))
+    text_files: list[Path] = []
+    for index, text in enumerate(_cta_lines_for_canvas(width, height), start=1):
+        path = tmp_dir / f"cta_follow_line{index}.txt"
+        path.write_text(text, encoding="utf-8")
+        text_files.append(path)
+
+    font = _drawtext_font_option()
+    vf = _cta_text_filter(font, text_files, width, height)
+    subprocess.run(
+        [
+            ffmpeg_binary(),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=0x121418:s={width}x{height}:r={fps}:d={CTA_CLIP_SECONDS}",
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=channel_layout={channel_layout}:sample_rate={sample_rate}:d={CTA_CLIP_SECONDS}",
+            "-vf",
+            vf,
+            *_cta_video_encoder_args(settings),
+            *_cta_audio_encoder_args(settings),
+            "-t",
+            str(CTA_CLIP_SECONDS),
+            *(
+                ["-video_track_timescale", timescale]
+                if (timescale := _video_track_timescale(settings.get("time_base") or "")) is not None
+                else []
+            ),
+            "-movflags",
+            "+faststart",
+            str(clip.resolve()),
+        ],
+        check=True,
+    )
+    return clip
+
+
+def prepend_cta_clip(input_video: Path, session: Path) -> Path:
+    media_dir = session / "media"
+    tmp_dir = session / "tmp"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    output_video = media_dir / "video_final_with_cta.mp4"
+    if input_video.resolve() == output_video.resolve():
+        raise ValueError("Cannot prepend CTA clip to its own output; use video_final.mp4 or video_source.mp4 as input.")
+    if output_video.exists():
+        return output_video
+
+    cta_clip = generate_cta_clip(input_video, session)
+    tmp_output = tmp_dir / "video_final_with_cta.tmp.mp4"
+    if tmp_output.exists():
+        tmp_output.unlink()
+
+    input_duration = _probe_duration(input_video)
+    timeout = max(600, int(((input_duration or 1800) + CTA_CLIP_SECONDS) * 3))
+    session_dir = session.resolve()
+    cta_input = cta_clip.resolve()
+    video_input = input_video.resolve()
+    tmp_resolved = tmp_output.resolve()
+    concat_file = tmp_dir / "concat_video.txt"
+    concat_file.write_text(
+        f"file '{_concat_file_path(cta_input)}'\nfile '{_concat_file_path(video_input)}'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            ffmpeg_binary(),
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file.resolve()),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(tmp_resolved),
+        ],
+        check=True,
+        timeout=timeout,
+        cwd=session_dir,
+    )
+
+    output_duration = _probe_duration(tmp_output)
+    if output_duration is None:
+        tmp_output.unlink(missing_ok=True)
+        raise RuntimeError(f"Cannot probe concatenated video duration: {tmp_output}")
+    if input_duration is not None and output_duration <= input_duration + 0.5:
+        tmp_output.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Concatenated video is too short: input={input_duration:.3f}s, output={output_duration:.3f}s"
+        )
+    tmp_output.replace(output_video)
+    return output_video
+
 def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_file: Path, session: Path) -> Path:
     tmp_dir = session / "tmp"
     media_dir = session / "media"
@@ -323,7 +668,7 @@ def merge_video(video_file: Path, dubbing_file: Path, bgm_file: Path, timings_fi
             "-i",
             str(bgm_input),
             "-filter_complex",
-            "[0:a]volume=1.0[a0];[1:a]volume=0.30[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0[aout]",
+            "[0:a]volume=0.90[a0];[1:a]volume=0.75[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0[aout]",
             "-map",
             "[aout]",
             "-c:a",
@@ -441,48 +786,82 @@ def trim_video(input_video: Path, cut_intervals: list[dict], session: Path) -> P
     session_dir = session.resolve()
     input_resolved = input_video.resolve()
     output_resolved = output_video.resolve()
-
-    trim_filters: list[str] = []
-    concat_inputs: list[str] = []
-    for i, (start, end) in enumerate(keep):
-        trim_filters.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];")
-        trim_filters.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}];")
-        concat_inputs.append(f"[v{i}][a{i}]")
-
-    n = len(keep)
-    filter_graph = "".join(trim_filters) + f"{''.join(concat_inputs)}concat=n={n}:v=1:a=1[outv][outa]"
+    parts_dir = session / "tmp" / "trim_parts"
+    tmp_output = parts_dir / "video_final_trimmed.tmp.mp4"
 
     encoders = _video_encoders()
     timeout = max(600, int(duration * 3))
     last_error: subprocess.SubprocessError | None = None
     for index, video_codec in enumerate(encoders):
+        if parts_dir.exists():
+            shutil.rmtree(parts_dir)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        parts: list[Path] = []
         try:
+            for part_index, (start, end) in enumerate(keep):
+                part = parts_dir / f"part_{part_index:04d}.mp4"
+                parts.append(part)
+                seek_margin = min(2.0, start)
+                subprocess.run(
+                    [
+                        ffmpeg_binary(),
+                        "-y",
+                        "-ss",
+                        str(max(0.0, start - seek_margin)),
+                        "-i",
+                        str(input_resolved),
+                        "-ss",
+                        str(seek_margin),
+                        "-t",
+                        str(max(0.0, end - start)),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a?",
+                        *video_codec,
+                        "-c:a",
+                        "aac",
+                        "-avoid_negative_ts",
+                        "make_zero",
+                        "-movflags",
+                        "+faststart",
+                        str(part.resolve()),
+                    ],
+                    check=True,
+                    timeout=max(600, int((end - start + seek_margin) * 3)),
+                    cwd=session_dir,
+                )
+
+            concat_file = parts_dir / "trim_concat.txt"
+            concat_file.write_text(
+                "".join(f"file '{_concat_file_path(part)}'\n" for part in parts),
+                encoding="utf-8",
+            )
             subprocess.run(
                 [
                     ffmpeg_binary(),
                     "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
                     "-i",
-                    str(input_resolved),
-                    "-filter_complex",
-                    filter_graph,
-                    "-map",
-                    "[outv]",
-                    "-map",
-                    "[outa]",
-                    *video_codec,
-                    "-c:a",
-                    "aac",
+                    str(concat_file.resolve()),
+                    "-c",
+                    "copy",
                     "-movflags",
                     "+faststart",
-                    str(output_resolved),
+                    str(tmp_output.resolve()),
                 ],
                 check=True,
                 timeout=timeout,
                 cwd=session_dir,
             )
+            tmp_output.replace(output_resolved)
             return output_video
         except subprocess.SubprocessError as error:
             last_error = error
+            tmp_output.unlink(missing_ok=True)
             detail = (
                 f"timed out after {timeout}s"
                 if isinstance(error, subprocess.TimeoutExpired)
@@ -494,5 +873,97 @@ def trim_video(input_video: Path, cut_intervals: list[dict], session: Path) -> P
                     f"falling back to {encoders[index + 1][1]}",
                     file=sys.stderr,
                 )
+        finally:
+            shutil.rmtree(parts_dir, ignore_errors=True)
     assert last_error is not None
     raise last_error
+
+
+def fast_trim_video(input_video: Path, cut_intervals: list[dict], session: Path) -> Path:
+    """Cut intervals with stream copy. Fast and lossless, but cuts near keyframes."""
+    media_dir = session / "media"
+    output_video = media_dir / "video_final_trimmed.mp4"
+    if output_video.exists():
+        return output_video
+
+    if not cut_intervals:
+        return input_video
+
+    duration = _probe_duration(input_video)
+    if duration is None:
+        raise RuntimeError(f"Cannot probe duration of {input_video}")
+
+    keep = _keep_intervals(cut_intervals, duration)
+    if not keep:
+        return input_video
+    if len(keep) == 1 and keep[0] == (0, duration):
+        return input_video
+
+    session_dir = session.resolve()
+    input_resolved = input_video.resolve()
+    output_resolved = output_video.resolve()
+    parts_dir = session / "tmp" / "fast_trim_parts"
+    if parts_dir.exists():
+        shutil.rmtree(parts_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    parts: list[Path] = []
+    try:
+        for index, (start, end) in enumerate(keep):
+            part = parts_dir / f"part_{index:04d}.mp4"
+            parts.append(part)
+            subprocess.run(
+                [
+                    ffmpeg_binary(),
+                    "-y",
+                    "-ss",
+                    str(start),
+                    "-i",
+                    str(input_resolved),
+                    "-t",
+                    str(max(0.0, end - start)),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a?",
+                    "-c",
+                    "copy",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    str(part.resolve()),
+                ],
+                check=True,
+                timeout=max(600, int((end - start) * 2)),
+                cwd=session_dir,
+            )
+
+        concat_file = parts_dir / "fast_trim_concat.txt"
+        concat_file.write_text(
+            "".join(f"file '{_concat_file_path(part)}'\n" for part in parts),
+            encoding="utf-8",
+        )
+        tmp_output = parts_dir / "video_final_trimmed.tmp.mp4"
+        subprocess.run(
+            [
+                ffmpeg_binary(),
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file.resolve()),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(tmp_output.resolve()),
+            ],
+            check=True,
+            timeout=max(600, int(duration)),
+            cwd=session_dir,
+        )
+        tmp_output.replace(output_resolved)
+    finally:
+        shutil.rmtree(parts_dir, ignore_errors=True)
+    return output_video

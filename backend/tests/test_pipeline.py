@@ -5,7 +5,7 @@ import sys
 import types
 from pathlib import Path
 
-from backend.app import database
+from backend.app import bilibili_uploads, database
 from backend.app import pipeline
 from backend.app.pipeline import PipelineRunner
 
@@ -44,7 +44,7 @@ def test_pipeline_marks_all_stages_succeeded(monkeypatch, tmp_path):
     final_path = tmp_path / "video_final.mp4"
     final_path.write_bytes(b"mp4")
 
-    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_concat_video", "_trim_video"):
         monkeypatch.setattr(PipelineRunner, name, _noop_stage)
 
     def merge_video(self, task):
@@ -57,8 +57,155 @@ def test_pipeline_marks_all_stages_succeeded(monkeypatch, tmp_path):
 
     assert task["status"] == "succeeded"
     assert task["final_video_path"] == str(final_path)
-    assert [stage["status"] for stage in task["stages"]] == ["succeeded"] * 10
-    assert [stage["progress"] for stage in task["stages"]] == [100] * 10
+    assert [stage["status"] for stage in task["stages"]] == ["succeeded"] * 11
+    assert [stage["progress"] for stage in task["stages"]] == [100] * 11
+
+
+def test_pipeline_auto_queues_bilibili_upload_on_success(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=autobilique",
+        task_id="autobilique",
+        auto_bilibili_upload=True,
+    )
+    final_path = tmp_path / "video_final.mp4"
+    final_path.write_bytes(b"mp4")
+    enqueued: list[str] = []
+    monkeypatch.setattr(bilibili_uploads, "enqueue", lambda job_id: enqueued.append(job_id))
+
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_concat_video", "_trim_video"):
+        monkeypatch.setattr(PipelineRunner, name, _noop_stage)
+
+    def merge_video(self, task):
+        database.update_task(task_id, title="自动发布标题")
+        self.artifacts.final_video = final_path
+
+    monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+
+    PipelineRunner(task_id).run()
+
+    assert len(enqueued) == 1
+    job = database.get_bilibili_upload_job(enqueued[0])
+    assert job["task_id"] == task_id
+    assert job["title"] == "自动发布标题"
+    assert job["publish_mode"] == "now"
+    assert job["status"] == "queued"
+
+
+def test_pipeline_auto_uses_saved_bilibili_upload_settings(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=autobiliset",
+        task_id="autobiliset",
+        auto_bilibili_upload=True,
+        bilibili_upload_title="预设投稿标题",
+        bilibili_publish_mode="scheduled",
+        bilibili_dtime="2999-07-01T18:00",
+        bilibili_upload_after="2999-07-01T01:00:00+00:00",
+    )
+    database.update_task(
+        task_id,
+        bilibili_upload_description="自动投稿简介",
+        bilibili_upload_tags="自动,标签",
+        bilibili_upload_tid=171,
+        bilibili_topic_name="宝可梦集结",
+    )
+    final_path = tmp_path / "video_final.mp4"
+    final_path.write_bytes(b"mp4")
+    enqueued: list[str] = []
+    monkeypatch.setattr(bilibili_uploads, "enqueue", lambda job_id: enqueued.append(job_id))
+
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_concat_video", "_trim_video"):
+        monkeypatch.setattr(PipelineRunner, name, _noop_stage)
+
+    def merge_video(self, task):
+        self.artifacts.final_video = final_path
+
+    monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+
+    PipelineRunner(task_id).run()
+
+    assert enqueued == []
+    job = database.get_active_bilibili_upload_job(task_id)
+    assert job is not None
+    assert job["title"] == "预设投稿标题"
+    assert job["description"] == "自动投稿简介"
+    assert job["tags"] == "自动,标签"
+    assert job["tid"] == 171
+    assert job["topic_name"] == "宝可梦集结"
+    assert job["publish_mode"] == "scheduled"
+    assert job["dtime"] == "2999-07-01T18:00"
+    assert job["upload_after"] == "2999-07-01T01:00:00+00:00"
+    assert job["status"] == "scheduled"
+
+
+def test_download_applies_author_topic_and_collection_defaults_to_auto_upload(monkeypatch, tmp_path):
+    from backend.app.adapters import ytdlp
+
+    configure_db(monkeypatch, tmp_path)
+    database.save_bilibili_settings(
+        "",
+        "",
+        author_config_json=json.dumps({
+            "WolfeyVGC": {
+                "topic_name": "宝可梦集结",
+                "topic_id": 1245603,
+                "topic_mission_id": 42,
+                "season_id": 123,
+                "section_id": 456,
+            }
+        }),
+    )
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=authorcfg01",
+        task_id="authorcfg01",
+        auto_bilibili_upload=True,
+    )
+    session = tmp_path / "session"
+    (session / "media").mkdir(parents=True)
+    monkeypatch.setattr(
+        ytdlp,
+        "download_video",
+        lambda *args: (session, {"title": "测试视频", "uploader": "WolfeyVGC"}),
+    )
+    enqueued: list[str] = []
+    monkeypatch.setattr(bilibili_uploads, "enqueue", lambda job_id: enqueued.append(job_id))
+
+    runner = PipelineRunner(task_id)
+    runner._download(database.get_task(task_id))
+    task = database.get_task(task_id)
+    assert task["bilibili_topic_name"] == "宝可梦集结"
+    assert task["bilibili_topic_id"] == 1245603
+    assert task["bilibili_topic_mission_id"] == 42
+    assert task["bilibili_season_id"] == 123
+    assert task["bilibili_section_id"] == 456
+
+    runner._maybe_enqueue_auto_bilibili_upload()
+    assert len(enqueued) == 1
+    job = database.get_bilibili_upload_job(enqueued[0])
+    assert job["topic_name"] == "宝可梦集结"
+    assert job["topic_id"] == 1245603
+    assert job["topic_mission_id"] == 42
+    assert job["season_id"] == 123
+    assert job["section_id"] == 456
+
+    override_id = database.create_task(
+        "https://www.youtube.com/watch?v=authorcfg02",
+        task_id="authorcfg02",
+    )
+    database.update_task(
+        override_id,
+        bilibili_topic_name="手动话题",
+        bilibili_topic_id=99,
+        bilibili_season_id=7,
+        bilibili_section_id=8,
+    )
+    PipelineRunner(override_id)._download(database.get_task(override_id))
+    overridden = database.get_task(override_id)
+    assert overridden["bilibili_topic_name"] == "手动话题"
+    assert overridden["bilibili_topic_id"] == 99
+    assert overridden["bilibili_season_id"] == 7
+    assert overridden["bilibili_section_id"] == 8
 
 
 def test_pipeline_skips_already_succeeded_stages(monkeypatch, tmp_path):
@@ -109,17 +256,22 @@ def test_pipeline_skips_already_succeeded_stages(monkeypatch, tmp_path):
         visited.append("_merge_video")
         self.artifacts.final_video = final_path
 
+    def concat_video(self, task):
+        visited.append("_concat_video")
+        self.artifacts.concatenated_video = final_path
+
     monkeypatch.setattr(PipelineRunner, "_asr_fix", asr_fix)
     monkeypatch.setattr(PipelineRunner, "_translate", translate)
     monkeypatch.setattr(PipelineRunner, "_split_audio", split_audio)
     monkeypatch.setattr(PipelineRunner, "_tts", tts)
     monkeypatch.setattr(PipelineRunner, "_merge_audio", merge_audio)
     monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+    monkeypatch.setattr(PipelineRunner, "_concat_video", concat_video)
 
     PipelineRunner(task_id).run()
 
     assert visited == [
-        "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_merge_video",
+        "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_merge_video", "_concat_video",
     ]
     task = database.get_task(task_id)
     assert task["status"] == "succeeded"
@@ -181,7 +333,7 @@ def test_pipeline_sends_success_notification(monkeypatch, tmp_path):
     final_path = tmp_path / "video_final.mp4"
     final_path.write_bytes(b"mp4")
 
-    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_concat_video", "_trim_video"):
         monkeypatch.setattr(PipelineRunner, name, _noop_stage)
 
     def merge_video(self, task):
@@ -205,7 +357,7 @@ def test_pipeline_notification_error_does_not_change_task_status(monkeypatch, tm
     final_path = tmp_path / "video_final.mp4"
     final_path.write_bytes(b"mp4")
 
-    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
+    for name in ("_download", "_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_concat_video", "_trim_video"):
         monkeypatch.setattr(PipelineRunner, name, _noop_stage)
 
     def merge_video(self, task):
@@ -261,6 +413,101 @@ def test_stage_progress_is_throttled(monkeypatch, tmp_path):
     assert stage["last_message"] == "Prepared 3/10 TTS clips"
 
 
+def test_trim_video_without_intervals_keeps_original(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=defaulttrim1", task_id="defaulttrim1")
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final_video = media / "video_final.mp4"
+    final_video.write_bytes(b"mp4")
+    trimmed_video = media / "video_final_trimmed.mp4"
+
+    def fake_trim_video(input_video, cut_intervals, trim_session):
+        raise AssertionError("trim_video should not run without cut intervals")
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.trim_video", fake_trim_video)
+
+    runner = PipelineRunner(task_id)
+    runner.artifacts.session = session
+    runner.artifacts.final_video = final_video
+    runner._trim_video(database.get_task(task_id))
+
+    intervals_file = session / "metadata" / "cut_intervals.json"
+    assert not intervals_file.exists()
+    assert database.get_task_cut_intervals(task_id) is None
+    assert not trimmed_video.exists()
+    assert runner.artifacts.trimmed_video == final_video
+
+
+def test_concat_video_uses_source_when_final_video_is_missing(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=concatfb001", task_id="concatfallback")
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    source_video = media / "video_source.mp4"
+    source_video.write_bytes(b"source")
+    concatenated = media / "video_final_with_cta.mp4"
+    captured: dict[str, Path] = {}
+
+    def fake_prepend_cta_clip(input_video, concat_session):
+        captured["input_video"] = input_video
+        captured["session"] = concat_session
+        concatenated.write_bytes(b"concat")
+        return concatenated
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.prepend_cta_clip", fake_prepend_cta_clip)
+
+    runner = PipelineRunner(task_id)
+    runner.artifacts.session = session
+    runner._concat_video(database.get_task(task_id))
+
+    assert captured == {"input_video": source_video, "session": session}
+    assert runner.artifacts.video_file == source_video
+    assert runner.artifacts.concatenated_video == concatenated
+
+
+def test_concat_video_skips_cta_for_zh_to_en(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.bilibili.com/video/BV1concatSkip", task_id="concatzh2en")
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final_video = media / "video_final.mp4"
+    final_video.write_bytes(b"final")
+
+    def fail_prepend_cta_clip(input_video, concat_session):
+        raise AssertionError("prepend_cta_clip should not run for zh->en")
+
+    monkeypatch.setattr("backend.app.adapters.ffmpeg.prepend_cta_clip", fail_prepend_cta_clip)
+
+    runner = PipelineRunner(task_id)
+    runner.artifacts.session = session
+    runner.artifacts.final_video = final_video
+    runner._concat_video(database.get_task(task_id))
+
+    assert runner.artifacts.concatenated_video == final_video
+    assert not (media / "video_final_with_cta.mp4").exists()
+
+
+def test_restore_cached_concat_stage_allows_missing_cta_for_zh_to_en(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.bilibili.com/video/BV1xx411c7mD", task_id="BV1xx411c7mD")
+    session = tmp_path / "session"
+    media = session / "media"
+    media.mkdir(parents=True)
+    final_video = media / "video_final.mp4"
+    final_video.write_bytes(b"final")
+    database.update_task(task_id, session_path=str(session))
+
+    runner = PipelineRunner(task_id)
+    runner._restore_cached_stage("concat_video", database.get_task(task_id))
+
+    assert runner.artifacts.final_video == final_video
+    assert runner.artifacts.concatenated_video == final_video
+
+
 def test_pipeline_manual_pauses_after_each_stage(monkeypatch, tmp_path):
     configure_db(monkeypatch, tmp_path)
     task_id = database.create_task(
@@ -287,7 +534,7 @@ def test_pipeline_manual_pauses_after_each_stage(monkeypatch, tmp_path):
 
         return handler
 
-    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_merge_video", "_trim_video"):
+    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_merge_video", "_concat_video", "_trim_video"):
         monkeypatch.setattr(PipelineRunner, name, fail_later(name))
 
     PipelineRunner(task_id).run()
@@ -334,7 +581,7 @@ def test_pipeline_manual_switch_to_auto_runs_remaining_stages(monkeypatch, tmp_p
 
     monkeypatch.setattr(PipelineRunner, "_download", download)
 
-    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_trim_video"):
+    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_concat_video", "_trim_video"):
         monkeypatch.setattr(PipelineRunner, name, _noop_stage)
 
     def merge_video(self, task):
@@ -427,6 +674,8 @@ def test_pipeline_uses_uploaded_srt_and_skips_model_stages(monkeypatch, tmp_path
     monkeypatch.setattr(PipelineRunner, "_tts", tts)
     monkeypatch.setattr(PipelineRunner, "_merge_audio", merge_audio)
     monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+    monkeypatch.setattr(PipelineRunner, "_concat_video", _noop_stage)
+    monkeypatch.setattr(PipelineRunner, "_trim_video", _noop_stage)
 
     PipelineRunner(task_id).run()
 
