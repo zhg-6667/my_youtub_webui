@@ -40,6 +40,59 @@ export type YouTubeChannelMonitor = {
   updated_at: string
 }
 
+export type YouTubeAuthorVideo = {
+  video_id: string
+  title: string
+  url: string
+  duration_seconds: number | null
+  thumbnail_url: string
+  published_at: string | null
+  published_date: string | null
+  metadata_checked: boolean
+  task_id: string | null
+  task_status: TaskStatus | null
+}
+
+export type YouTubeVideoMetadata = Pick<YouTubeAuthorVideo, "video_id" | "published_at" | "published_date" | "metadata_checked">
+
+export function fetchYouTubeVideoMetadata(items: { video_id: string; channel_id: string | null }[], signal?: AbortSignal) {
+  return request<{ videos: YouTubeVideoMetadata[] }>("/api/youtube-videos/metadata", {
+    method: "POST", body: JSON.stringify({ items }), signal,
+  })
+}
+
+export type BatchTaskResult = {
+  url: string
+  video_id?: string
+  task_id: string | null
+  task_status: TaskStatus | null
+  status: "created" | "existing" | "failed"
+  error: string | null
+}
+
+export function createTasksBatch(urls: string[], executionMode: ExecutionMode, autoBilibiliUpload: boolean) {
+  return request<{ results: BatchTaskResult[]; created: number; existing: number; failed: number }>("/api/tasks/batch", {
+    method: "POST", body: JSON.stringify({ urls, execution_mode: executionMode, auto_bilibili_upload: autoBilibiliUpload }),
+  })
+}
+
+export type YouTubeAuthorResult = {
+  input_url: string
+  channel_url: string
+  channel_id: string | null
+  title: string
+  videos: YouTubeAuthorVideo[]
+  shorts: YouTubeAuthorVideo[]
+  errors: Partial<Record<"channel" | "videos" | "shorts", string>>
+}
+
+export function lookupYouTubeAuthors(channelUrls: string[], latestCount: number) {
+  return request<{ channels: YouTubeAuthorResult[] }>("/api/youtube-authors/lookup", {
+    method: "POST",
+    body: JSON.stringify({ channel_urls: channelUrls, latest_count: latestCount }),
+  })
+}
+
 export type TaskStage = {
   task_id: string
   name: string

@@ -175,6 +175,7 @@ remove_mp4.py
 data/
 workfolder/
 env.txt
+/cookies.json
 
 # Next.js
 apps/web/.next/

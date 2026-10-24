@@ -267,6 +267,16 @@ npm --prefix apps/web run dev -- --hostname 0.0.0.0 --port 3000
 npm --prefix apps/web run dev -- --hostname 0.0.0.0 --port 3000
 ```
 
+macOS 完成上述环境和依赖安装后，也可双击项目根目录的 `启动YouDub.command`，
+一次启动前后端并自动打开网页。或者在项目根目录执行：
+
+```bash
+npm run dev
+```
+
+运行期间保留启动终端；按 `Ctrl+C` 可同时关闭前后端。重复启动时会检测现有服务，
+避免重复占用端口。一键启动默认仅监听本机 `127.0.0.1`。
+
 前端默认通过同源 `/api/...` 请求访问后端，并由 Next.js 代理到 `http://127.0.0.1:8000`。如果后端不在本机 `8000` 端口，启动前端时设置 `NEXT_SERVER_API_BASE_URL`，例如：
 
 ```bash

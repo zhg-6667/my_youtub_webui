@@ -248,6 +248,33 @@ def test_youtube_channel_monitor_adds_new_videos_with_duration(monkeypatch, tmp_
     assert links[0]["duration_seconds"] == 742
 
 
+def test_youtube_author_lookup_api(monkeypatch):
+    calls = []
+
+    def fake_lookup(urls, count):
+        calls.append((urls, count))
+        return [{"title": "Author", "videos": [], "shorts": [], "errors": {}}]
+
+    monkeypatch.setattr(main.youtube_channel_lookup, "lookup_authors", fake_lookup)
+    client = TestClient(main.app)
+    urls = ["https://www.youtube.com/@pokedexfillers", "https://www.youtube.com/@WolfeyVGC"]
+    response = client.post("/api/youtube-authors/lookup", json={"channel_urls": urls, "latest_count": 12})
+    assert response.status_code == 200
+    assert response.json()["channels"][0]["title"] == "Author"
+    assert calls == [(urls, 12)]
+
+
+@pytest.mark.parametrize("payload", [
+    {"channel_urls": []}, {"channel_urls": ["url"] * 21},
+    {"channel_urls": ["url"], "latest_count": 0},
+    {"channel_urls": ["url"], "latest_count": 101},
+    {"channel_urls": ["url"], "latest_count": 1.5},
+])
+def test_youtube_author_lookup_validates_limits(payload):
+    response = TestClient(main.app).post("/api/youtube-authors/lookup", json=payload)
+    assert response.status_code == 422
+
+
 def test_translate_bilibili_title_uses_ai_settings(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     database.save_openai_settings("https://example.com/v1", "sk-test", "test-model")

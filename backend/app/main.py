@@ -8,6 +8,7 @@ import sys
 import uuid
 import json as _json
 import time
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from . import bilibili_cover, bilibili_schedule, bilibili_uploads, database, watermark_masks, worker, youtube_channel_monitor
+from . import bilibili_cover, bilibili_schedule, bilibili_uploads, database, watermark_masks, worker, youtube_channel_lookup, youtube_channel_monitor, youtube_video_metadata
 from .adapters.local_subtitles import parse_srt, uploaded_subtitle_dir
 from .adapters.local_video import remove_upload, uploaded_video_dir
 from .adapters.openai_translate import list_models as list_openai_models
@@ -46,6 +47,7 @@ BILIBILI_UPLOAD_VIDEO_CANDIDATES = (
     "video_final.mp4",
     "video_source.mp4",
 )
+_task_creation_lock = threading.Lock()
 
 
 def mask_secret(value: str) -> str:
@@ -112,6 +114,26 @@ class YouTubeChannelMonitorUpdate(BaseModel):
     enabled: bool | None = None
     check_interval_minutes: int | None = None
     latest_count: int | None = None
+
+
+class YouTubeAuthorLookupRequest(BaseModel):
+    channel_urls: list[str] = Field(min_length=1, max_length=youtube_channel_lookup.MAX_CHANNELS)
+    latest_count: int = Field(default=5, ge=1, le=youtube_channel_lookup.MAX_LATEST_COUNT)
+
+
+class YouTubeVideoMetadataItem(BaseModel):
+    video_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
+    channel_id: str | None = Field(default=None, pattern=r"^UC[A-Za-z0-9_-]{22}$")
+
+
+class YouTubeVideoMetadataRequest(BaseModel):
+    items: list[YouTubeVideoMetadataItem] = Field(min_length=1, max_length=12)
+
+
+class BatchTaskCreate(BaseModel):
+    urls: list[str] = Field(min_length=1, max_length=100)
+    execution_mode: str = "auto"
+    auto_bilibili_upload: bool = False
 
 
 class ContinueTaskRequest(BaseModel):
@@ -664,6 +686,27 @@ def normalize_monitor_latest_count(value: int | None) -> int:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.post("/api/youtube-authors/lookup")
+def lookup_youtube_authors(payload: YouTubeAuthorLookupRequest) -> dict:
+    return {"channels": youtube_channel_lookup.lookup_authors(payload.channel_urls, payload.latest_count)}
+
+
+@app.post("/api/youtube-videos/metadata")
+def youtube_videos_metadata(payload: YouTubeVideoMetadataRequest) -> dict:
+    return {"videos": youtube_video_metadata.fetch_video_metadata([item.model_dump() for item in payload.items])}
+
+
+@app.get("/api/youtube-videos/{video_id}/thumbnail")
+def youtube_video_thumbnail(video_id: str) -> FileResponse:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise HTTPException(status_code=422, detail="Invalid YouTube video ID.")
+    try:
+        path = youtube_video_metadata.thumbnail_path(video_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Thumbnail unavailable.") from exc
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/api/youtube-channel-monitors")
 def list_youtube_channel_monitors() -> dict:
     return {
@@ -736,12 +779,40 @@ def check_youtube_channel_monitor(monitor_id: str) -> dict:
 
 @app.post("/api/tasks", status_code=201)
 def create_task(payload: TaskCreate) -> dict:
+    return _create_task_once(payload)[0]
+
+
+@app.post("/api/tasks/batch")
+def create_tasks_batch(payload: BatchTaskCreate) -> dict:
+    mode = normalize_execution_mode(payload.execution_mode)
+    results = []
+    for url in payload.urls:
+        try:
+            task, created = _create_task_once(TaskCreate(
+                url=url, execution_mode=mode, auto_bilibili_upload=payload.auto_bilibili_upload,
+            ))
+            results.append({"url": url, "video_id": extract_video_id(url), "task_id": task["id"],
+                            "task_status": task["status"], "status": "created" if created else "existing", "error": None})
+        except Exception as exc:
+            error = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+            results.append({"url": url, "status": "failed", "task_id": None, "task_status": None, "error": error})
+    return {"results": results, **{status: sum(item["status"] == status for item in results)
+                                   for status in ("created", "existing", "failed")}}
+
+
+def _create_task_once(payload: TaskCreate) -> tuple[dict, bool]:
+    # Serialize the check/insert/enqueue sequence, including concurrent single-task requests.
+    with _task_creation_lock:
+        return _create_task_impl(payload)
+
+
+def _create_task_impl(payload: TaskCreate) -> tuple[dict, bool]:
     url, video_id = normalize_video_link_url(payload.url)
 
     existing_id = database.find_task_by_video_id(video_id)
     if existing_id:
         database.mark_video_link_record_task(video_id, existing_id)
-        return _task_with_source(database.get_task(existing_id))
+        return _task_with_source(database.get_task(existing_id)), False
 
     _ensure_runtime_ready()
     publish_mode, dtime, upload_after = _normalize_bilibili_upload_settings(
@@ -761,7 +832,7 @@ def create_task(payload: TaskCreate) -> dict:
     )
     database.mark_video_link_record_task(video_id, task_id)
     worker.enqueue(task_id)
-    return _task_with_source(database.get_task(task_id))
+    return _task_with_source(database.get_task(task_id)), True
 
 
 def _clean_upload_filename(filename: str | None) -> str:

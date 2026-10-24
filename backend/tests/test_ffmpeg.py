@@ -84,7 +84,7 @@ def test_merge_video_burns_portrait_subtitles(monkeypatch, tmp_path):
     def fake_run(cmd, capture_output=False, text=False, check=False, **kwargs):
         commands.append(cmd)
         cwd_values.append(kwargs.get("cwd"))
-        if cmd[0] == "ffprobe":
+        if cmd[0] == ffmpeg.ffprobe_binary():
             return subprocess.CompletedProcess(cmd, 0, stdout="720,1280\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -265,6 +265,22 @@ def test_write_srt_splits_long_sentence_into_multiple_entries(tmp_path):
     blocks = [b for b in content.strip().split("\n\n") if b.strip()]
     assert len(blocks) >= 3
     assert all("-->" in b for b in blocks)
+
+
+def test_cta_font_uses_macos_cjk_font_when_windows_fonts_are_unavailable(monkeypatch):
+    monkeypatch.delenv("CTA_FONT_FILE", raising=False)
+    mac_font = "/System/Library/Fonts/STHeiti Medium.ttc"
+    monkeypatch.setattr(Path, "exists", lambda path: path.as_posix() == mac_font)
+
+    assert ffmpeg._drawtext_font_option() == f"fontfile='{ffmpeg._filter_path(Path(mac_font))}'"
+
+
+def test_cta_font_preserves_explicit_font_override(monkeypatch, tmp_path):
+    custom_font = tmp_path / "custom cjk.ttf"
+    custom_font.write_bytes(b"font")
+    monkeypatch.setenv("CTA_FONT_FILE", str(custom_font))
+
+    assert ffmpeg._drawtext_font_option() == f"fontfile='{ffmpeg._filter_path(custom_font)}'"
 
 
 def test_generate_cta_clip_matches_reference_stream(monkeypatch, tmp_path):

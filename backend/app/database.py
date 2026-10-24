@@ -144,6 +144,13 @@ def init_db() -> None:
               FOREIGN KEY (last_task_id) REFERENCES tasks(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS youtube_video_metadata (
+              video_id TEXT PRIMARY KEY,
+              published_at TEXT,
+              published_date TEXT,
+              checked_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS youtube_channel_monitors (
               id TEXT PRIMARY KEY,
               channel_url TEXT NOT NULL,
@@ -383,6 +390,48 @@ def create_task(
             [(new_id, stage.name, stage.label) for stage in STAGES],
         )
     return new_id
+
+
+def get_youtube_video_metadata(video_ids: list[str]) -> dict[str, dict[str, Any]]:
+    result = {}
+    with connect() as conn:
+        for offset in range(0, len(video_ids), 500):
+            chunk = video_ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT * FROM youtube_video_metadata WHERE video_id IN ({placeholders})", chunk,
+            ).fetchall()
+            result.update({row["video_id"]: dict(row) for row in rows})
+    return result
+
+
+def cache_youtube_video_metadata(video_id: str, published_at: str | None, published_date: str | None) -> dict:
+    checked_at = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO youtube_video_metadata (video_id, published_at, published_date, checked_at)
+               VALUES (?, ?, ?, ?) ON CONFLICT(video_id) DO UPDATE SET
+               published_at = COALESCE(excluded.published_at, youtube_video_metadata.published_at),
+               published_date = COALESCE(excluded.published_date, youtube_video_metadata.published_date),
+               checked_at = excluded.checked_at""",
+            (video_id, published_at, published_date, checked_at),
+        )
+    return get_youtube_video_metadata([video_id])[video_id]
+
+
+def youtube_task_snapshot() -> dict[str, dict[str, str]]:
+    from .youtube import extract_video_id
+
+    result = {}
+    with connect() as conn:
+        rows = conn.execute("SELECT id, url, status FROM tasks ORDER BY created_at, rowid").fetchall()
+    for row in rows:
+        try:
+            video_id = extract_video_id(row["url"])
+        except ValueError:
+            continue
+        result[video_id] = {"task_id": row["id"], "task_status": row["status"]}
+    return result
 
 
 def find_task_by_video_id(video_id: str) -> str | None:

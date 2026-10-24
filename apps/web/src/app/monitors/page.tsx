@@ -12,6 +12,7 @@ import {
   updateYouTubeChannelMonitor,
 } from "@/lib/api"
 import { useI18n } from "@/lib/i18n"
+import { YouTubeAuthorLookup } from "@/components/youtube-author-lookup"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -129,7 +130,8 @@ export function ChannelMonitorsContent() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-4xl flex-col gap-6">
+    <div className="flex w-full min-w-0 flex-col gap-6">
+      <YouTubeAuthorLookup />
       <Card>
         <CardHeader>
           <CardTitle>{t.home.channelMonitors} ({channelMonitors.length})</CardTitle>
